@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MTDPS v0.2.0 — Minor Thesis Data Processing System."""
+"""MTDPS v0.2.1 — Minor Thesis Data Processing System."""
 
 from __future__ import annotations
 
@@ -13,11 +13,12 @@ import re
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 DEFAULT_INPUT_DIR = Path(
     r"D:\Data\Desktop\研二上\MT1-90043\202608-Participant Data"
@@ -68,7 +69,10 @@ TIMESERIES_FIELDS = [
     "planning_mode",
     "familiarity",
     "topic",
+    "observation_type",
     "minute",
+    "elapsed_time_ms",
+    "elapsed_time_seconds",
     "cumulative_word_count",
     "delta_word_count",
     "actual_writing_time_seconds",
@@ -94,6 +98,12 @@ KEYSTROKE_REQUIRED_COLUMNS = {
     "planning_mode",
     "time_ms",
     "event",
+    "key",
+    "inputType",
+    "data",
+    "cursor_start",
+    "cursor_end",
+    "word_count",
 }
 
 SYSTEM_BASENAMES = {
@@ -134,6 +144,24 @@ class Snapshot:
     text: str
     declared_word_count: int | None
     cumulative_word_count: int
+
+
+@dataclass(frozen=True)
+class WritingEndObservation:
+    """The final writing endpoint recorded in the keystroke log."""
+
+    elapsed_time_ms: Decimal
+    cumulative_word_count: int
+
+
+@dataclass(frozen=True)
+class KeystrokeResult:
+    """Validated information extracted from one keystroke CSV."""
+
+    info: zipfile.ZipInfo | None
+    row_count: int | None
+    writing_end: WritingEndObservation | None
+    warnings: list[str]
 
 
 @dataclass(frozen=True)
@@ -230,10 +258,7 @@ def metadata_candidates(
 
             continue
 
-        if (
-            isinstance(value, dict)
-            and METADATA_IDENTITY_KEYS.issubset(value)
-        ):
+        if isinstance(value, dict) and METADATA_IDENTITY_KEYS.issubset(value):
             candidates.append((info, value))
 
     return candidates
@@ -280,13 +305,108 @@ def find_final_essay(
     return info, raw
 
 
+def decimal_from_csv(value: str, field: str) -> Decimal:
+    """Parse a finite decimal stored in a CSV field."""
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise PackageError(f"Invalid {field} in keystroke log: {value!r}") from exc
+
+    if not parsed.is_finite():
+        raise PackageError(f"Non-finite {field} in keystroke log: {value!r}")
+
+    return parsed
+
+
+def parse_writing_end(
+    rows: list[dict[str, str]],
+    participant: str,
+    task: int,
+    condition: str,
+) -> tuple[WritingEndObservation | None, list[str]]:
+    """Parse the unique writing_end endpoint from a keystroke log."""
+    warnings: list[str] = []
+    start_rows = [row for row in rows if row.get("event") == "writing_start"]
+
+    if not start_rows:
+        warnings.append("missing_keystroke_writing_start")
+    elif len(start_rows) > 1:
+        warnings.append(
+            f"multiple_keystroke_writing_start(count={len(start_rows)})"
+        )
+    else:
+        start_time = decimal_from_csv(
+            start_rows[0].get("time_ms", ""),
+            "writing_start time_ms",
+        )
+        if start_time != 0:
+            warnings.append(
+                "nonzero_keystroke_writing_start"
+                f"(time_ms={decimal_csv(start_time)})"
+            )
+
+    end_rows = [row for row in rows if row.get("event") == "writing_end"]
+
+    if not end_rows:
+        warnings.append("missing_keystroke_writing_end")
+        return None, warnings
+
+    if len(end_rows) > 1:
+        warnings.append(f"multiple_keystroke_writing_end(count={len(end_rows)})")
+        return None, warnings
+
+    row = end_rows[0]
+    expected_identity = {
+        "subject_code": participant,
+        "task_number": str(task),
+        "topic_code": condition,
+    }
+    for key, expected in expected_identity.items():
+        observed = str(row.get(key, ""))
+        if key == "topic_code":
+            observed = observed.lower()
+        if observed != expected:
+            warnings.append(f"keystroke_{key}_mismatch")
+
+    elapsed_time_ms = decimal_from_csv(row.get("time_ms", ""), "writing_end time_ms")
+
+    if elapsed_time_ms < 0:
+        raise PackageError(
+            f"Negative writing_end time_ms in keystroke log: {elapsed_time_ms}"
+        )
+
+    try:
+        word_count = int(row.get("word_count", ""))
+    except (TypeError, ValueError) as exc:
+        raise PackageError(
+            "Invalid writing_end word_count in keystroke log: "
+            f"{row.get('word_count')!r}"
+        ) from exc
+
+    if word_count < 0:
+        raise PackageError(
+            f"Negative writing_end word_count in keystroke log: {word_count}"
+        )
+
+    return (
+        WritingEndObservation(
+            elapsed_time_ms=elapsed_time_ms,
+            cumulative_word_count=word_count,
+        ),
+        warnings,
+    )
+
+
 def find_keystroke_log(
     archive: zipfile.ZipFile,
     members: list[zipfile.ZipInfo],
-) -> tuple[zipfile.ZipInfo | None, int | None, list[str]]:
-    """Identify the keystroke CSV by columns and count its data rows."""
+    participant: str,
+    task: int,
+    condition: str,
+) -> KeystrokeResult:
+    """Identify the keystroke CSV and parse its final writing endpoint."""
     warnings: list[str] = []
-    candidates: list[tuple[zipfile.ZipInfo, int]] = []
+    candidates: list[tuple[zipfile.ZipInfo, list[dict[str, str]]]] = []
 
     for info in members:
         if not info.filename.lower().endswith(".csv"):
@@ -298,7 +418,7 @@ def find_keystroke_log(
             columns = set(reader.fieldnames or [])
 
             if KEYSTROKE_REQUIRED_COLUMNS.issubset(columns):
-                candidates.append((info, sum(1 for _ in reader)))
+                candidates.append((info, list(reader)))
         except (UnicodeDecodeError, csv.Error) as exc:
             if "keystroke" in info.filename.lower():
                 raise PackageError(
@@ -306,17 +426,31 @@ def find_keystroke_log(
                 ) from exc
 
     if not candidates:
-        warnings.append("missing_keystroke_log")
-        return None, None, warnings
+        warnings.extend(
+            [
+                "missing_keystroke_log",
+                "missing_final_keystroke_timepoint",
+            ]
+        )
+        return KeystrokeResult(None, None, None, warnings)
 
     if len(candidates) > 1:
         names = ", ".join(info.filename for info, _ in candidates)
-        raise PackageError(
-            f"Multiple keystroke log candidates: {names}"
-        )
+        raise PackageError(f"Multiple keystroke log candidates: {names}")
 
-    info, row_count = candidates[0]
-    return info, row_count, warnings
+    info, rows = candidates[0]
+    writing_end, endpoint_warnings = parse_writing_end(
+        rows,
+        participant,
+        task,
+        condition,
+    )
+    warnings.extend(endpoint_warnings)
+
+    if writing_end is None:
+        warnings.append("missing_final_keystroke_timepoint")
+
+    return KeystrokeResult(info, len(rows), writing_end, warnings)
 
 
 def count_words(text: str) -> int:
@@ -343,9 +477,7 @@ def parse_snapshot_text(
     ]
 
     if malformed_headers:
-        warnings.append(
-            f"malformed_minute_header(count={len(malformed_headers)})"
-        )
+        warnings.append(f"malformed_minute_header(count={len(malformed_headers)})")
 
     if not headers:
         return [], warnings
@@ -479,9 +611,7 @@ def find_snapshots(
 
     if len(valid_candidates) > 1:
         names = ", ".join(info.filename for info, _ in valid_candidates)
-        raise PackageError(
-            f"Multiple minute snapshot candidates: {names}"
-        )
+        raise PackageError(f"Multiple minute snapshot candidates: {names}")
 
     if valid_candidates:
         info, text = valid_candidates[0]
@@ -502,9 +632,7 @@ def find_snapshots(
         return info, snapshots, warnings
 
     if len(named_without_headers) > 1:
-        names = ", ".join(
-            info.filename for info, _ in named_without_headers
-        )
+        names = ", ".join(info.filename for info, _ in named_without_headers)
         raise PackageError(
             f"Multiple unparseable minute snapshot candidates: {names}"
         )
@@ -578,8 +706,7 @@ def validate_identity(
 
     if not SAFE_COMPONENT_RE.fullmatch(participant):
         raise PackageError(
-            "Unsafe subject_code for output filename: "
-            f"{participant!r}"
+            f"Unsafe subject_code for output filename: {participant!r}"
         )
 
     if task < 1:
@@ -587,8 +714,7 @@ def validate_identity(
 
     if not SAFE_COMPONENT_RE.fullmatch(condition):
         raise PackageError(
-            "Unsafe topic_code for output filename: "
-            f"{condition!r}"
+            f"Unsafe topic_code for output filename: {condition!r}"
         )
 
     return participant, task, condition, planning_mode, familiarity
@@ -619,8 +745,17 @@ def research_fingerprint(
     return digest.hexdigest()
 
 
+def decimal_csv(value: Decimal) -> str:
+    """Render a Decimal without exponent notation or unnecessary zeros."""
+    rendered = format(value, "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
 def build_timeseries_rows(
     snapshots: list[Snapshot],
+    writing_end: WritingEndObservation | None,
     participant: str,
     task: int,
     condition: str,
@@ -629,14 +764,13 @@ def build_timeseries_rows(
     metadata: dict[str, Any],
     source_zip: str,
 ) -> list[dict[str, Any]]:
-    """Convert observed snapshots to long-format time-series rows."""
+    """Create minute rows plus the final keystroke writing endpoint."""
     rows: list[dict[str, Any]] = []
     previous_word_count = 0
 
     for snapshot in snapshots:
-        delta_word_count = (
-            snapshot.cumulative_word_count - previous_word_count
-        )
+        elapsed_ms = snapshot.minute * 60_000
+        delta_word_count = snapshot.cumulative_word_count - previous_word_count
 
         rows.append(
             {
@@ -646,7 +780,10 @@ def build_timeseries_rows(
                 "planning_mode": planning_mode,
                 "familiarity": familiarity,
                 "topic": metadata_value(metadata, "topic"),
+                "observation_type": "minute_snapshot",
                 "minute": snapshot.minute,
+                "elapsed_time_ms": elapsed_ms,
+                "elapsed_time_seconds": snapshot.minute * 60,
                 "cumulative_word_count": snapshot.cumulative_word_count,
                 "delta_word_count": delta_word_count,
                 "actual_writing_time_seconds": metadata_value(
@@ -658,11 +795,47 @@ def build_timeseries_rows(
                     "writing_end_reason",
                 ),
                 "source_zip": source_zip,
-                "_snapshot_sequence": snapshot.sequence,
+                "_observation_sequence": snapshot.sequence,
+                "_sort_elapsed_time_ms": Decimal(elapsed_ms),
+                "_sort_observation_type": 0,
             }
         )
 
         previous_word_count = snapshot.cumulative_word_count
+
+    if writing_end is not None:
+        elapsed_seconds = writing_end.elapsed_time_ms / Decimal(1000)
+        delta_word_count = (
+            writing_end.cumulative_word_count - previous_word_count
+        )
+        rows.append(
+            {
+                "participant": participant,
+                "task": task,
+                "condition": condition,
+                "planning_mode": planning_mode,
+                "familiarity": familiarity,
+                "topic": metadata_value(metadata, "topic"),
+                "observation_type": "writing_end",
+                "minute": "",
+                "elapsed_time_ms": decimal_csv(writing_end.elapsed_time_ms),
+                "elapsed_time_seconds": decimal_csv(elapsed_seconds),
+                "cumulative_word_count": writing_end.cumulative_word_count,
+                "delta_word_count": delta_word_count,
+                "actual_writing_time_seconds": metadata_value(
+                    metadata,
+                    "actual_writing_time_seconds",
+                ),
+                "writing_end_reason": metadata_value(
+                    metadata,
+                    "writing_end_reason",
+                ),
+                "source_zip": source_zip,
+                "_observation_sequence": len(snapshots) + 1,
+                "_sort_elapsed_time_ms": writing_end.elapsed_time_ms,
+                "_sort_observation_type": 1,
+            }
+        )
 
     return rows
 
@@ -676,22 +849,17 @@ def process_zip(path: Path) -> ParsedPackage:
             corrupt_member = archive.testzip()
 
             if corrupt_member is not None:
-                raise PackageError(
-                    f"CRC failure in member: {corrupt_member}"
-                )
+                raise PackageError(f"CRC failure in member: {corrupt_member}")
 
             all_members = archive.infolist()
-            members = [
-                info for info in all_members if is_research_member(info)
-            ]
+            members = [info for info in all_members if is_research_member(info)]
             ignored_count = sum(
                 1 for info in all_members if not is_research_member(info)
             )
 
             if ignored_count:
                 warnings.append(
-                    "ignored_system_or_directory_entries="
-                    f"{ignored_count}"
+                    f"ignored_system_or_directory_entries={ignored_count}"
                 )
 
             unsafe_paths = [
@@ -701,9 +869,7 @@ def process_zip(path: Path) -> ParsedPackage:
             ]
 
             if unsafe_paths:
-                warnings.append(
-                    "unsafe_member_paths_present_not_extracted"
-                )
+                warnings.append("unsafe_member_paths_present_not_extracted")
 
             metadata_matches = metadata_candidates(archive, members)
 
@@ -713,12 +879,8 @@ def process_zip(path: Path) -> ParsedPackage:
                 )
 
             if len(metadata_matches) > 1:
-                names = ", ".join(
-                    info.filename for info, _ in metadata_matches
-                )
-                raise PackageError(
-                    f"Multiple metadata candidates: {names}"
-                )
+                names = ", ".join(info.filename for info, _ in metadata_matches)
+                raise PackageError(f"Multiple metadata candidates: {names}")
 
             metadata_info, metadata = metadata_matches[0]
             (
@@ -734,29 +896,26 @@ def process_zip(path: Path) -> ParsedPackage:
             if condition != expected_condition:
                 warnings.append(
                     "condition_code_mismatch"
-                    f"(topic_code={condition},"
-                    f"derived={expected_condition})"
+                    f"(topic_code={condition},derived={expected_condition})"
                 )
 
             if planning_mode not in {"a", "i", "n"}:
-                warnings.append(
-                    f"unexpected_planning_mode={planning_mode}"
-                )
+                warnings.append(f"unexpected_planning_mode={planning_mode}")
 
             if familiarity not in {"h", "l"}:
-                warnings.append(
-                    f"unexpected_familiarity={familiarity}"
-                )
+                warnings.append(f"unexpected_familiarity={familiarity}")
 
             final_info, essay_bytes = find_final_essay(archive, members)
             essay_text = essay_bytes.decode("utf-8")
 
-            (
-                keystroke_info,
-                keystroke_rows,
-                keystroke_warnings,
-            ) = find_keystroke_log(archive, members)
-            warnings.extend(keystroke_warnings)
+            keystroke = find_keystroke_log(
+                archive,
+                members,
+                participant,
+                task,
+                condition,
+            )
+            warnings.extend(keystroke.warnings)
 
             (
                 snapshot_info,
@@ -800,17 +959,59 @@ def process_zip(path: Path) -> ParsedPackage:
                         )
                 except (TypeError, ValueError):
                     warnings.append(
-                        "invalid_final_word_count="
-                        f"{metadata_word_count!r}"
+                        f"invalid_final_word_count={metadata_word_count!r}"
                     )
+
+            if keystroke.writing_end is not None:
+                if (
+                    keystroke.writing_end.cumulative_word_count
+                    != computed_word_count
+                ):
+                    warnings.append(
+                        "keystroke_final_word_count_mismatch"
+                        f"(keystroke="
+                        f"{keystroke.writing_end.cumulative_word_count},"
+                        f"computed={computed_word_count})"
+                    )
+
+                metadata_time = metadata.get("actual_writing_time_ms")
+                if metadata_time not in (None, ""):
+                    try:
+                        metadata_time_decimal = Decimal(str(metadata_time))
+                        if not metadata_time_decimal.is_finite():
+                            raise InvalidOperation
+                        difference = abs(
+                            metadata_time_decimal
+                            - keystroke.writing_end.elapsed_time_ms
+                        )
+                        if difference > Decimal("1"):
+                            warnings.append(
+                                "keystroke_writing_end_time_mismatch"
+                                f"(keystroke_ms="
+                                f"{decimal_csv(keystroke.writing_end.elapsed_time_ms)},"
+                                f"metadata_ms={metadata_time},"
+                                f"difference_ms={decimal_csv(difference)})"
+                            )
+                    except (InvalidOperation, ValueError):
+                        warnings.append(
+                            f"invalid_actual_writing_time_ms={metadata_time!r}"
+                        )
+
+                if snapshots:
+                    last_snapshot_time = Decimal(snapshots[-1].minute * 60_000)
+                    if keystroke.writing_end.elapsed_time_ms < last_snapshot_time:
+                        warnings.append(
+                            "keystroke_writing_end_precedes_last_snapshot"
+                            f"(writing_end_ms="
+                            f"{decimal_csv(keystroke.writing_end.elapsed_time_ms)},"
+                            f"last_snapshot_ms={decimal_csv(last_snapshot_time)})"
+                        )
 
             if snapshots and (
                 normalise_text_for_comparison(snapshots[-1].text)
                 != normalise_text_for_comparison(essay_text)
             ):
-                warnings.append(
-                    "last_snapshot_differs_from_final_essay"
-                )
+                warnings.append("last_snapshot_differs_from_final_essay")
 
             if chat_data is not None:
                 for key, expected in (
@@ -818,21 +1019,16 @@ def process_zip(path: Path) -> ParsedPackage:
                     ("task_number", task),
                     ("topic_code", condition),
                 ):
-                    if (
-                        key in chat_data
-                        and str(chat_data[key]) != str(expected)
-                    ):
+                    if key in chat_data and str(chat_data[key]) != str(expected):
                         warnings.append(f"chat_{key}_mismatch")
 
-            raw_filename = (
-                f"{participant}_task{task}_{condition}.txt"
-            )
+            raw_filename = f"{participant}_task{task}_{condition}.txt"
             fingerprint = research_fingerprint(
                 archive,
                 (
                     ("metadata", metadata_info),
                     ("final_essay", final_info),
-                    ("keystroke_log", keystroke_info),
+                    ("keystroke_log", keystroke.info),
                     ("minute_snapshots", snapshot_info),
                     ("ai_chat", chat_info),
                 ),
@@ -840,6 +1036,7 @@ def process_zip(path: Path) -> ParsedPackage:
 
             timeseries_rows = build_timeseries_rows(
                 snapshots,
+                keystroke.writing_end,
                 participant,
                 task,
                 condition,
@@ -853,10 +1050,7 @@ def process_zip(path: Path) -> ParsedPackage:
                 "participant": participant,
                 "task": task,
                 "condition": condition,
-                "condition_label": metadata_value(
-                    metadata,
-                    "condition",
-                ),
+                "condition_label": metadata_value(metadata, "condition"),
                 "planning_mode": planning_mode,
                 "familiarity": familiarity,
                 "topic": metadata_value(metadata, "topic"),
@@ -892,15 +1086,12 @@ def process_zip(path: Path) -> ParsedPackage:
                     metadata,
                     "writing_end_reason",
                 ),
-                "word_count": metadata_value(
-                    metadata,
-                    "final_word_count",
-                ),
+                "word_count": metadata_value(metadata, "final_word_count"),
                 "snapshot_count": (
                     "" if snapshot_info is None else len(snapshots)
                 ),
                 "keystroke_rows": (
-                    "" if keystroke_rows is None else keystroke_rows
+                    "" if keystroke.row_count is None else keystroke.row_count
                 ),
                 "ai_chat_present": ai_chat_present,
                 "source_zip": path.name,
@@ -926,10 +1117,7 @@ def process_zip(path: Path) -> ParsedPackage:
 def atomic_write_bytes(path: Path, content: bytes) -> None:
     """Write generated binary output atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        dir=path.parent,
-        delete=False,
-    )
+    handle = tempfile.NamedTemporaryFile(dir=path.parent, delete=False)
     temporary_path = Path(handle.name)
 
     try:
@@ -1005,10 +1193,7 @@ def process_batch(
     )
 
     output_path.mkdir(parents=True, exist_ok=True)
-    (output_path / "texts_raw").mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    (output_path / "texts_raw").mkdir(parents=True, exist_ok=True)
 
     manifest_rows: list[dict[str, Any]] = []
     report_rows: list[dict[str, Any]] = []
@@ -1031,10 +1216,7 @@ def process_batch(
             previous = seen.get(identity)
 
             if previous is not None:
-                if (
-                    previous.research_sha256
-                    == package.research_sha256
-                ):
+                if previous.research_sha256 == package.research_sha256:
                     duplicates += 1
                     report_rows.append(
                         {
@@ -1057,9 +1239,8 @@ def process_batch(
                     continue
 
                 raise PackageError(
-                    "Conflicting packages share "
-                    "participant-task-condition but have different "
-                    "research contents: "
+                    "Conflicting packages share participant-task-condition "
+                    "but have different research contents: "
                     f"{previous.source_zip.name} and {zip_path.name}"
                 )
 
@@ -1110,8 +1291,9 @@ def process_batch(
         key=lambda row: (
             str(row["participant"]),
             int(row["task"]),
-            int(row["minute"]),
-            int(row["_snapshot_sequence"]),
+            row["_sort_elapsed_time_ms"],
+            int(row["_sort_observation_type"]),
+            int(row["_observation_sequence"]),
         )
     )
 
@@ -1119,21 +1301,9 @@ def process_batch(
     report_path = output_path / "processing_report.csv"
     timeseries_path = output_path / "writing_timeseries.csv"
 
-    atomic_write_csv(
-        manifest_path,
-        MANIFEST_FIELDS,
-        manifest_rows,
-    )
-    atomic_write_csv(
-        report_path,
-        REPORT_FIELDS,
-        report_rows,
-    )
-    atomic_write_csv(
-        timeseries_path,
-        TIMESERIES_FIELDS,
-        timeseries_rows,
-    )
+    atomic_write_csv(manifest_path, MANIFEST_FIELDS, manifest_rows)
+    atomic_write_csv(report_path, REPORT_FIELDS, report_rows)
+    atomic_write_csv(timeseries_path, TIMESERIES_FIELDS, timeseries_rows)
 
     return BatchSummary(
         discovered=len(zip_paths),
@@ -1151,8 +1321,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mtdps",
         description=(
-            "Read Gamma ZIP data packages and export manifest.csv, "
-            "raw essays, and writing_timeseries.csv."
+            "Read Gamma ZIP data packages and export manifest.csv, raw "
+            "essays, and writing_timeseries.csv."
         ),
     )
 
@@ -1171,10 +1341,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=DEFAULT_OUTPUT_DIR,
         type=Path,
-        help=(
-            "Generated output folder "
-            f"(default: {DEFAULT_OUTPUT_DIR})"
-        ),
+        help=f"Generated output folder (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--version",
