@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MTDPS v0.2.1 — Minor Thesis Data Processing System."""
+"""MTDPS v0.3.0 — Minor Thesis Data Processing System."""
 
 from __future__ import annotations
 
@@ -12,13 +12,14 @@ import os
 import re
 import tempfile
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 DEFAULT_INPUT_DIR = Path(
     r"D:\Data\Desktop\研二上\MT1-90043\202608-Participant Data"
@@ -80,6 +81,27 @@ TIMESERIES_FIELDS = [
     "source_zip",
 ]
 
+QC_FIELDS = [
+    "source_zip",
+    "participant",
+    "task",
+    "condition",
+    "rule",
+    "category",
+    "severity",
+    "result",
+    "evidence",
+]
+
+QC_SEVERITIES = {"INFO", "WARNING", "FLAG", "ERROR"}
+QC_RESULTS = {"PASS", "FAIL", "NOT_CHECKED"}
+SEVERITY_RANK = {
+    "INFO": 0,
+    "WARNING": 1,
+    "FLAG": 2,
+    "ERROR": 3,
+}
+
 METADATA_IDENTITY_KEYS = {
     "subject_code",
     "task_number",
@@ -134,6 +156,25 @@ SNAPSHOT_PREAMBLE_RE = re.compile(
 class PackageError(Exception):
     """A Gamma ZIP package cannot be processed reliably."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        rule: str = "PACKAGE_PROCESSING_ERROR",
+        category: str = "archive",
+        severity: str = "ERROR",
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.rule = rule
+        self.category = category
+        self.severity = severity
+        self.evidence = evidence or {"error": message}
+        self.participant = ""
+        self.task: int | str = ""
+        self.condition = ""
+        self.qc_rows: list[dict[str, Any]] = []
+
 
 @dataclass(frozen=True)
 class Snapshot:
@@ -165,6 +206,34 @@ class KeystrokeResult:
 
 
 @dataclass(frozen=True)
+class QCRecord:
+    """One machine-readable quality-control result."""
+
+    source_zip: str
+    participant: str
+    task: int | str
+    condition: str
+    rule: str
+    category: str
+    severity: str
+    result: str
+    evidence: str
+
+    def as_row(self) -> dict[str, Any]:
+        return {
+            "source_zip": self.source_zip,
+            "participant": self.participant,
+            "task": self.task,
+            "condition": self.condition,
+            "rule": self.rule,
+            "category": self.category,
+            "severity": self.severity,
+            "result": self.result,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass(frozen=True)
 class BatchSummary:
     discovered: int
     processed: int
@@ -174,6 +243,7 @@ class BatchSummary:
     manifest_path: Path
     report_path: Path
     timeseries_path: Path
+    qc_path: Path
 
 
 @dataclass
@@ -184,6 +254,59 @@ class ParsedPackage:
     essay_bytes: bytes
     research_sha256: str
     warnings: list[str]
+    qc_rows: list[dict[str, Any]]
+
+
+def qc_evidence(**values: Any) -> str:
+    """Encode QC evidence as stable, machine-readable JSON."""
+    return json.dumps(values, ensure_ascii=False, sort_keys=True)
+
+
+def make_qc_row(
+    source_zip: str,
+    participant: str,
+    task: int | str,
+    condition: str,
+    rule: str,
+    category: str,
+    severity: str,
+    result: str,
+    **evidence: Any,
+) -> dict[str, Any]:
+    """Build and validate one QC result row."""
+    if severity not in QC_SEVERITIES:
+        raise ValueError(f"Unsupported QC severity: {severity}")
+    if result not in QC_RESULTS:
+        raise ValueError(f"Unsupported QC result: {result}")
+
+    return QCRecord(
+        source_zip=source_zip,
+        participant=participant,
+        task=task,
+        condition=condition,
+        rule=rule,
+        category=category,
+        severity=severity,
+        result=result,
+        evidence=qc_evidence(**evidence),
+    ).as_row()
+
+
+def qc_summary(qc_rows: Iterable[dict[str, Any]]) -> str:
+    """Create a compact compatibility summary for legacy warnings fields."""
+    findings = [
+        row
+        for row in qc_rows
+        if row["result"] == "FAIL" and row["severity"] != "INFO"
+    ]
+    if not findings:
+        return ""
+
+    highest = max(
+        findings,
+        key=lambda row: SEVERITY_RANK[str(row["severity"])],
+    )["severity"]
+    return f"qc_findings={len(findings)}; qc_max_severity={highest}"
 
 
 def normalise_member_name(name: str) -> str:
@@ -253,7 +376,9 @@ def metadata_candidates(
 
             if "metadata" in basename:
                 raise PackageError(
-                    f"Metadata candidate is invalid JSON: {info.filename}"
+                    f"Metadata candidate is invalid JSON: {info.filename}",
+                    rule="METADATA_JSON_VALID",
+                    evidence={"filename": info.filename},
                 )
 
             continue
@@ -292,14 +417,33 @@ def find_final_essay(
         ).name.lower().endswith("_final_text.txt")
     ]
 
-    info = choose_single(candidates, "final essay")
+    if not candidates:
+        raise PackageError(
+            "Missing final essay",
+            rule="FINAL_ESSAY_PRESENT_UNIQUE",
+            evidence={"candidate_count": 0},
+        )
+    if len(candidates) > 1:
+        raise PackageError(
+            "Multiple final essay candidates: "
+            + ", ".join(info.filename for info in candidates),
+            rule="FINAL_ESSAY_PRESENT_UNIQUE",
+            evidence={
+                "candidate_count": len(candidates),
+                "candidates": [info.filename for info in candidates],
+            },
+        )
+
+    info = candidates[0]
     raw = archive.read(info)
 
     try:
         raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise PackageError(
-            f"Final essay is not valid UTF-8: {info.filename}"
+            f"Final essay is not valid UTF-8: {info.filename}",
+            rule="FINAL_ESSAY_UTF8_VALID",
+            evidence={"filename": info.filename, "error": str(exc)},
         ) from exc
 
     return info, raw
@@ -310,10 +454,20 @@ def decimal_from_csv(value: str, field: str) -> Decimal:
     try:
         parsed = Decimal(value)
     except (InvalidOperation, ValueError) as exc:
-        raise PackageError(f"Invalid {field} in keystroke log: {value!r}") from exc
+        raise PackageError(
+            f"Invalid {field} in keystroke log: {value!r}",
+            rule="KEYSTROKE_TIME_VALUES_VALID",
+            category="keystroke",
+            evidence={"field": field, "value": value},
+        ) from exc
 
     if not parsed.is_finite():
-        raise PackageError(f"Non-finite {field} in keystroke log: {value!r}")
+        raise PackageError(
+            f"Non-finite {field} in keystroke log: {value!r}",
+            rule="KEYSTROKE_TIME_VALUES_VALID",
+            category="keystroke",
+            evidence={"field": field, "value": value},
+        )
 
     return parsed
 
@@ -372,7 +526,10 @@ def parse_writing_end(
 
     if elapsed_time_ms < 0:
         raise PackageError(
-            f"Negative writing_end time_ms in keystroke log: {elapsed_time_ms}"
+            f"Negative writing_end time_ms in keystroke log: {elapsed_time_ms}",
+            rule="KEYSTROKE_TIME_VALUES_VALID",
+            category="keystroke",
+            evidence={"event": "writing_end", "time_ms": str(elapsed_time_ms)},
         )
 
     try:
@@ -380,12 +537,18 @@ def parse_writing_end(
     except (TypeError, ValueError) as exc:
         raise PackageError(
             "Invalid writing_end word_count in keystroke log: "
-            f"{row.get('word_count')!r}"
+            f"{row.get('word_count')!r}",
+            rule="KEYSTROKE_WRITING_END_WORD_COUNT_VALID",
+            category="word_count",
+            evidence={"value": row.get("word_count")},
         ) from exc
 
     if word_count < 0:
         raise PackageError(
-            f"Negative writing_end word_count in keystroke log: {word_count}"
+            f"Negative writing_end word_count in keystroke log: {word_count}",
+            rule="KEYSTROKE_WRITING_END_WORD_COUNT_VALID",
+            category="word_count",
+            evidence={"value": word_count},
         )
 
     return (
@@ -407,6 +570,7 @@ def find_keystroke_log(
     """Identify the keystroke CSV and parse its final writing endpoint."""
     warnings: list[str] = []
     candidates: list[tuple[zipfile.ZipInfo, list[dict[str, str]]]] = []
+    named_missing_columns: list[tuple[zipfile.ZipInfo, list[str]]] = []
 
     for info in members:
         if not info.filename.lower().endswith(".csv"):
@@ -419,11 +583,37 @@ def find_keystroke_log(
 
             if KEYSTROKE_REQUIRED_COLUMNS.issubset(columns):
                 candidates.append((info, list(reader)))
+            elif "keystroke" in info.filename.lower():
+                named_missing_columns.append(
+                    (
+                        info,
+                        sorted(KEYSTROKE_REQUIRED_COLUMNS - columns),
+                    )
+                )
         except (UnicodeDecodeError, csv.Error) as exc:
             if "keystroke" in info.filename.lower():
                 raise PackageError(
-                    f"Invalid keystroke CSV in {info.filename}: {exc}"
+                    f"Invalid keystroke CSV in {info.filename}: {exc}",
+                    rule="KEYSTROKE_CSV_VALID",
+                    category="keystroke",
+                    evidence={"filename": info.filename, "error": str(exc)},
                 ) from exc
+
+    if named_missing_columns:
+        raise PackageError(
+            "Keystroke CSV is missing required columns",
+            rule="KEYSTROKE_COLUMNS_COMPLETE",
+            category="keystroke",
+            evidence={
+                "files": [
+                    {
+                        "filename": info.filename,
+                        "missing_columns": missing,
+                    }
+                    for info, missing in named_missing_columns
+                ]
+            },
+        )
 
     if not candidates:
         warnings.extend(
@@ -436,7 +626,15 @@ def find_keystroke_log(
 
     if len(candidates) > 1:
         names = ", ".join(info.filename for info, _ in candidates)
-        raise PackageError(f"Multiple keystroke log candidates: {names}")
+        raise PackageError(
+            f"Multiple keystroke log candidates: {names}",
+            rule="KEYSTROKE_FILE_PRESENT_UNIQUE",
+            category="keystroke",
+            evidence={
+                "candidate_count": len(candidates),
+                "candidates": [info.filename for info, _ in candidates],
+            },
+        )
 
     info, rows = candidates[0]
     writing_end, endpoint_warnings = parse_writing_end(
@@ -597,7 +795,10 @@ def find_snapshots(
         except UnicodeDecodeError as exc:
             if "snapshot" in basename:
                 raise PackageError(
-                    f"Invalid snapshot UTF-8 in {info.filename}: {exc}"
+                    f"Invalid snapshot UTF-8 in {info.filename}: {exc}",
+                    rule="SNAPSHOT_UTF8_VALID",
+                    category="snapshot",
+                    evidence={"filename": info.filename, "error": str(exc)},
                 ) from exc
 
             continue
@@ -611,7 +812,15 @@ def find_snapshots(
 
     if len(valid_candidates) > 1:
         names = ", ".join(info.filename for info, _ in valid_candidates)
-        raise PackageError(f"Multiple minute snapshot candidates: {names}")
+        raise PackageError(
+            f"Multiple minute snapshot candidates: {names}",
+            rule="SNAPSHOT_FILE_PRESENT_UNIQUE",
+            category="snapshot",
+            evidence={
+                "candidate_count": len(valid_candidates),
+                "candidates": [info.filename for info, _ in valid_candidates],
+            },
+        )
 
     if valid_candidates:
         info, text = valid_candidates[0]
@@ -634,7 +843,15 @@ def find_snapshots(
     if len(named_without_headers) > 1:
         names = ", ".join(info.filename for info, _ in named_without_headers)
         raise PackageError(
-            f"Multiple unparseable minute snapshot candidates: {names}"
+            f"Multiple unparseable minute snapshot candidates: {names}",
+            rule="SNAPSHOT_FILE_PRESENT_UNIQUE",
+            category="snapshot",
+            evidence={
+                "candidate_count": len(named_without_headers),
+                "candidates": [
+                    info.filename for info, _ in named_without_headers
+                ],
+            },
         )
 
     if named_without_headers:
@@ -672,7 +889,12 @@ def find_chat_log(
             value = json.loads(archive.read(info).decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             if "chat" in info.filename.lower():
-                raise PackageError(f"Invalid chat JSON: {info.filename}")
+                raise PackageError(
+                    f"Invalid chat JSON: {info.filename}",
+                    rule="AI_CHAT_JSON_VALID",
+                    category="ai_chat",
+                    evidence={"filename": info.filename},
+                )
 
             continue
 
@@ -681,7 +903,15 @@ def find_chat_log(
 
     if len(candidates) > 1:
         names = ", ".join(info.filename for info, _ in candidates)
-        raise PackageError(f"Multiple AI chat log candidates: {names}")
+        raise PackageError(
+            f"Multiple AI chat log candidates: {names}",
+            rule="AI_CHAT_FILE_PRESENT_UNIQUE",
+            category="ai_chat",
+            evidence={
+                "candidate_count": len(candidates),
+                "candidates": [info.filename for info, _ in candidates],
+            },
+        )
 
     if candidates:
         return candidates[0]
@@ -698,7 +928,12 @@ def validate_identity(
     try:
         task = int(metadata["task_number"])
     except (TypeError, ValueError) as exc:
-        raise PackageError("task_number is not an integer") from exc
+        raise PackageError(
+            "task_number is not an integer",
+            rule="METADATA_IDENTITY_VALID",
+            category="identity",
+            evidence={"field": "task_number", "value": metadata["task_number"]},
+        ) from exc
 
     condition = str(metadata["topic_code"]).lower()
     planning_mode = str(metadata["planning_mode"]).lower()
@@ -706,15 +941,26 @@ def validate_identity(
 
     if not SAFE_COMPONENT_RE.fullmatch(participant):
         raise PackageError(
-            f"Unsafe subject_code for output filename: {participant!r}"
+            f"Unsafe subject_code for output filename: {participant!r}",
+            rule="METADATA_IDENTITY_VALID",
+            category="identity",
+            evidence={"field": "subject_code", "value": participant},
         )
 
     if task < 1:
-        raise PackageError(f"Invalid task_number: {task}")
+        raise PackageError(
+            f"Invalid task_number: {task}",
+            rule="METADATA_IDENTITY_VALID",
+            category="identity",
+            evidence={"field": "task_number", "value": task},
+        )
 
     if not SAFE_COMPONENT_RE.fullmatch(condition):
         raise PackageError(
-            f"Unsafe topic_code for output filename: {condition!r}"
+            f"Unsafe topic_code for output filename: {condition!r}",
+            rule="METADATA_IDENTITY_VALID",
+            category="identity",
+            evidence={"field": "topic_code", "value": condition},
         )
 
     return participant, task, condition, planning_mode, familiarity
@@ -751,6 +997,950 @@ def decimal_csv(value: Decimal) -> str:
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return rendered or "0"
+
+
+def build_qc_rows(
+    archive: zipfile.ZipFile,
+    all_members: list[zipfile.ZipInfo],
+    members: list[zipfile.ZipInfo],
+    metadata_info: zipfile.ZipInfo,
+    metadata: dict[str, Any],
+    final_info: zipfile.ZipInfo,
+    essay_text: str,
+    keystroke: KeystrokeResult,
+    snapshot_info: zipfile.ZipInfo | None,
+    snapshots: list[Snapshot],
+    chat_info: zipfile.ZipInfo | None,
+    chat_data: dict[str, Any] | None,
+    participant: str,
+    task: int,
+    condition: str,
+    planning_mode: str,
+    familiarity: str,
+    source_zip: str,
+) -> list[dict[str, Any]]:
+    """Run structured package, identity, content, and timing QC rules."""
+    rows: list[dict[str, Any]] = []
+
+    def add(
+        rule: str,
+        category: str,
+        severity: str,
+        result: str,
+        **evidence: Any,
+    ) -> None:
+        rows.append(
+            make_qc_row(
+                source_zip,
+                participant,
+                task,
+                condition,
+                rule,
+                category,
+                severity,
+                result,
+                **evidence,
+            )
+        )
+
+    def scalar_match(
+        rule: str,
+        source: str,
+        field: str,
+        observed: Any,
+        expected: Any,
+        *,
+        normalise_lower: bool = False,
+    ) -> None:
+        if observed is None or observed == "":
+            add(
+                rule,
+                "identity",
+                "FLAG",
+                "FAIL",
+                source=source,
+                field=field,
+                expected=expected,
+                observed=None,
+                reason="field_missing",
+            )
+            return
+
+        observed_text = str(observed)
+        expected_text = str(expected)
+        if normalise_lower:
+            observed_text = observed_text.lower()
+            expected_text = expected_text.lower()
+        matches = observed_text == expected_text
+        add(
+            rule,
+            "identity",
+            "FLAG",
+            "PASS" if matches else "FAIL",
+            source=source,
+            field=field,
+            expected=expected_text,
+            observed=observed_text,
+        )
+
+    def set_match(
+        rule: str,
+        field: str,
+        values: set[str],
+        expected: Any,
+        *,
+        normalise_lower: bool = False,
+    ) -> None:
+        if not values:
+            add(
+                rule,
+                "identity",
+                "FLAG",
+                "NOT_CHECKED",
+                source="keystroke",
+                field=field,
+                reason="no_keystroke_rows",
+            )
+            return
+
+        observed_values = {
+            value.lower() if normalise_lower else value for value in values
+        }
+        expected_text = str(expected)
+        if normalise_lower:
+            expected_text = expected_text.lower()
+        matches = observed_values == {expected_text}
+        add(
+            rule,
+            "identity",
+            "FLAG",
+            "PASS" if matches else "FAIL",
+            source="keystroke",
+            field=field,
+            expected=expected_text,
+            observed=sorted(observed_values),
+        )
+
+    ignored_members = [
+        info.filename for info in all_members if not is_research_member(info)
+    ]
+    unsafe_members = [
+        info.filename for info in members if unsafe_member_path(info.filename)
+    ]
+
+    add(
+        "ARCHIVE_READABLE",
+        "archive",
+        "ERROR",
+        "PASS",
+        member_count=len(all_members),
+    )
+    add(
+        "ARCHIVE_CRC_VALID",
+        "archive",
+        "ERROR",
+        "PASS",
+        checked_members=len(all_members),
+    )
+    add(
+        "ARCHIVE_SYSTEM_ENTRIES_ABSENT",
+        "archive",
+        "INFO",
+        "FAIL" if ignored_members else "PASS",
+        count=len(ignored_members),
+        members=ignored_members,
+    )
+    add(
+        "ARCHIVE_MEMBER_PATHS_SAFE",
+        "archive",
+        "WARNING",
+        "FAIL" if unsafe_members else "PASS",
+        count=len(unsafe_members),
+        members=unsafe_members,
+        extraction_performed=False,
+    )
+    add(
+        "METADATA_PRESENT_UNIQUE",
+        "archive",
+        "ERROR",
+        "PASS",
+        filename=metadata_info.filename,
+    )
+    add(
+        "METADATA_JSON_VALID",
+        "archive",
+        "ERROR",
+        "PASS",
+        filename=metadata_info.filename,
+    )
+    add(
+        "FINAL_ESSAY_PRESENT_UNIQUE",
+        "archive",
+        "ERROR",
+        "PASS",
+        filename=final_info.filename,
+    )
+    add(
+        "FINAL_ESSAY_UTF8_VALID",
+        "archive",
+        "ERROR",
+        "PASS",
+        filename=final_info.filename,
+    )
+
+    derived_condition = planning_mode + familiarity
+    add(
+        "METADATA_CONDITION_CODE_MATCH",
+        "identity",
+        "FLAG",
+        "PASS" if condition == derived_condition else "FAIL",
+        topic_code=condition,
+        planning_mode=planning_mode,
+        familiarity=familiarity,
+        derived_condition=derived_condition,
+    )
+    add(
+        "METADATA_PLANNING_MODE_VALID",
+        "identity",
+        "FLAG",
+        "PASS" if planning_mode in {"a", "i", "n"} else "FAIL",
+        observed=planning_mode,
+        allowed=["a", "i", "n"],
+    )
+    add(
+        "METADATA_FAMILIARITY_VALID",
+        "identity",
+        "FLAG",
+        "PASS" if familiarity in {"h", "l"} else "FAIL",
+        observed=familiarity,
+        allowed=["h", "l"],
+    )
+
+    metadata_word_count: int | None = None
+    raw_metadata_word_count = metadata.get("final_word_count")
+    try:
+        metadata_word_count = int(raw_metadata_word_count)
+        metadata_wc_valid = metadata_word_count >= 0
+    except (TypeError, ValueError):
+        metadata_wc_valid = False
+
+    add(
+        "FINAL_WORD_COUNT_METADATA_VALID",
+        "word_count",
+        "FLAG",
+        "PASS" if metadata_wc_valid else "FAIL",
+        observed=raw_metadata_word_count,
+    )
+    if not metadata_wc_valid:
+        metadata_word_count = None
+
+    essay_word_count = count_words(essay_text)
+    keystroke_word_count = (
+        None
+        if keystroke.writing_end is None
+        else keystroke.writing_end.cumulative_word_count
+    )
+
+    def word_count_pair(
+        rule: str,
+        first_name: str,
+        first_value: int | None,
+        second_name: str,
+        second_value: int | None,
+    ) -> None:
+        if first_value is None or second_value is None:
+            add(
+                rule,
+                "word_count",
+                "FLAG",
+                "NOT_CHECKED",
+                first_source=first_name,
+                first_value=first_value,
+                second_source=second_name,
+                second_value=second_value,
+                reason="one_or_more_sources_unavailable",
+            )
+            return
+
+        matches = first_value == second_value
+        add(
+            rule,
+            "word_count",
+            "FLAG",
+            "PASS" if matches else "FAIL",
+            first_source=first_name,
+            first_value=first_value,
+            second_source=second_name,
+            second_value=second_value,
+            difference=first_value - second_value,
+        )
+
+    word_count_pair(
+        "WORD_COUNT_METADATA_VS_FINAL_ESSAY",
+        "metadata.final_word_count",
+        metadata_word_count,
+        "final_essay_recalculated",
+        essay_word_count,
+    )
+    word_count_pair(
+        "WORD_COUNT_METADATA_VS_KEYSTROKE",
+        "metadata.final_word_count",
+        metadata_word_count,
+        "keystroke.writing_end.word_count",
+        keystroke_word_count,
+    )
+    word_count_pair(
+        "WORD_COUNT_FINAL_ESSAY_VS_KEYSTROKE",
+        "final_essay_recalculated",
+        essay_word_count,
+        "keystroke.writing_end.word_count",
+        keystroke_word_count,
+    )
+    add(
+        "PROTOCOL_FINAL_WORD_COUNT_200_250",
+        "protocol",
+        "FLAG",
+        "PASS" if 200 <= essay_word_count <= 250 else "FAIL",
+        observed=essay_word_count,
+        minimum=200,
+        maximum=250,
+        source="final_essay_recalculated",
+    )
+
+    add(
+        "SNAPSHOT_FILE_PRESENT",
+        "snapshot",
+        "WARNING",
+        "PASS" if snapshot_info is not None else "FAIL",
+        filename=None if snapshot_info is None else snapshot_info.filename,
+    )
+    add(
+        "SNAPSHOT_UTF8_VALID",
+        "snapshot",
+        "ERROR",
+        "PASS" if snapshot_info is not None else "NOT_CHECKED",
+        filename=None if snapshot_info is None else snapshot_info.filename,
+        reason=None if snapshot_info is not None else "snapshot_file_unavailable",
+    )
+
+    if snapshot_info is None:
+        for rule in (
+            "SNAPSHOT_HEADERS_WELL_FORMED",
+            "SNAPSHOT_MINUTES_START_AT_1",
+            "SNAPSHOT_MINUTES_UNIQUE",
+            "SNAPSHOT_MINUTES_CONTIGUOUS",
+            "SNAPSHOT_DECLARED_WORD_COUNTS_PRESENT",
+            "SNAPSHOT_WORD_COUNTS_MATCH",
+            "SNAPSHOT_COUNT_MATCH_WRITING_TIME",
+            "SNAPSHOT_SUBJECT_CODE_MATCH",
+            "SNAPSHOT_TASK_NUMBER_MATCH",
+            "SNAPSHOT_TOPIC_CODE_MATCH",
+            "LAST_SNAPSHOT_MATCHES_FINAL_ESSAY",
+        ):
+            category = "identity" if "_MATCH" in rule and rule.startswith(
+                "SNAPSHOT_"
+            ) and rule not in {
+                "SNAPSHOT_WORD_COUNTS_MATCH",
+                "SNAPSHOT_COUNT_MATCH_WRITING_TIME",
+            } else "snapshot"
+            add(
+                rule,
+                category,
+                "FLAG" if category == "identity" else "WARNING",
+                "NOT_CHECKED",
+                reason="snapshot_file_unavailable",
+            )
+    else:
+        snapshot_text = archive.read(snapshot_info).decode("utf-8-sig")
+        snapshot_normalised = normalise_newlines(snapshot_text)
+        headers = list(SNAPSHOT_HEADER_RE.finditer(snapshot_normalised))
+        exact_header_lines = {match.group(0) for match in headers}
+        malformed_headers = [
+            match.group(0)
+            for match in SNAPSHOT_HEADER_LIKE_RE.finditer(snapshot_normalised)
+            if match.group(0) not in exact_header_lines
+        ]
+        headers_valid = bool(headers) and not malformed_headers
+        add(
+            "SNAPSHOT_HEADERS_WELL_FORMED",
+            "snapshot",
+            "WARNING",
+            "PASS" if headers_valid else "FAIL",
+            valid_header_count=len(headers),
+            malformed_headers=malformed_headers,
+        )
+
+        minutes = [snapshot.minute for snapshot in snapshots]
+        if not minutes:
+            for rule in (
+                "SNAPSHOT_MINUTES_START_AT_1",
+                "SNAPSHOT_MINUTES_UNIQUE",
+                "SNAPSHOT_MINUTES_CONTIGUOUS",
+                "SNAPSHOT_DECLARED_WORD_COUNTS_PRESENT",
+                "SNAPSHOT_WORD_COUNTS_MATCH",
+            ):
+                add(
+                    rule,
+                    "snapshot",
+                    "WARNING",
+                    "NOT_CHECKED",
+                    reason="no_valid_minute_blocks",
+                )
+        else:
+            add(
+                "SNAPSHOT_MINUTES_START_AT_1",
+                "snapshot",
+                "WARNING",
+                "PASS" if minutes[0] == 1 else "FAIL",
+                first_observed_minute=minutes[0],
+            )
+            duplicates = sorted(
+                minute
+                for minute, count in Counter(minutes).items()
+                if count > 1
+            )
+            add(
+                "SNAPSHOT_MINUTES_UNIQUE",
+                "snapshot",
+                "WARNING",
+                "PASS" if not duplicates else "FAIL",
+                duplicate_minutes=duplicates,
+            )
+            expected_minutes = list(range(1, len(minutes) + 1))
+            add(
+                "SNAPSHOT_MINUTES_CONTIGUOUS",
+                "snapshot",
+                "WARNING",
+                "PASS" if minutes == expected_minutes else "FAIL",
+                observed=minutes,
+                expected=expected_minutes,
+            )
+
+            missing_declared = [
+                snapshot.minute
+                for snapshot in snapshots
+                if snapshot.declared_word_count is None
+            ]
+            if missing_declared:
+                for minute in missing_declared:
+                    add(
+                        "SNAPSHOT_DECLARED_WORD_COUNTS_PRESENT",
+                        "snapshot",
+                        "WARNING",
+                        "FAIL",
+                        minute=minute,
+                        declared_word_count=None,
+                    )
+            else:
+                add(
+                    "SNAPSHOT_DECLARED_WORD_COUNTS_PRESENT",
+                    "snapshot",
+                    "WARNING",
+                    "PASS",
+                    checked_minutes=len(snapshots),
+                )
+
+            mismatches = [
+                snapshot
+                for snapshot in snapshots
+                if snapshot.declared_word_count is not None
+                and snapshot.declared_word_count
+                != snapshot.cumulative_word_count
+            ]
+            if mismatches:
+                for snapshot in mismatches:
+                    add(
+                        "SNAPSHOT_WORD_COUNTS_MATCH",
+                        "snapshot",
+                        "WARNING",
+                        "FAIL",
+                        minute=snapshot.minute,
+                        declared=snapshot.declared_word_count,
+                        recalculated=snapshot.cumulative_word_count,
+                    )
+            else:
+                add(
+                    "SNAPSHOT_WORD_COUNTS_MATCH",
+                    "snapshot",
+                    "WARNING",
+                    "PASS",
+                    checked_minutes=len(snapshots),
+                )
+
+        preamble_end = headers[0].start() if headers else len(snapshot_normalised)
+        preamble = snapshot_normalised[:preamble_end]
+        preamble_fields = {
+            key.lower().replace(" ", "_"): value
+            for key, value in SNAPSHOT_PREAMBLE_RE.findall(preamble)
+        }
+        scalar_match(
+            "SNAPSHOT_SUBJECT_CODE_MATCH",
+            "snapshot",
+            "subject_code",
+            preamble_fields.get("subject_code"),
+            participant,
+        )
+        scalar_match(
+            "SNAPSHOT_TASK_NUMBER_MATCH",
+            "snapshot",
+            "task_number",
+            preamble_fields.get("task_number"),
+            task,
+        )
+        scalar_match(
+            "SNAPSHOT_TOPIC_CODE_MATCH",
+            "snapshot",
+            "topic_code",
+            preamble_fields.get("topic_code"),
+            condition,
+            normalise_lower=True,
+        )
+
+        actual_writing_ms: Decimal | None = None
+        raw_writing_ms = metadata.get("actual_writing_time_ms")
+        try:
+            actual_writing_ms = Decimal(str(raw_writing_ms))
+            if not actual_writing_ms.is_finite() or actual_writing_ms < 0:
+                actual_writing_ms = None
+        except (InvalidOperation, ValueError):
+            actual_writing_ms = None
+
+        if actual_writing_ms is None:
+            add(
+                "SNAPSHOT_COUNT_MATCH_WRITING_TIME",
+                "snapshot",
+                "WARNING",
+                "NOT_CHECKED",
+                observed_snapshot_count=len(snapshots),
+                actual_writing_time_ms=raw_writing_ms,
+                reason="invalid_or_missing_actual_writing_time_ms",
+            )
+        else:
+            expected_snapshot_count = int(
+                actual_writing_ms // Decimal(60_000)
+            )
+            add(
+                "SNAPSHOT_COUNT_MATCH_WRITING_TIME",
+                "snapshot",
+                "WARNING",
+                "PASS"
+                if len(snapshots) == expected_snapshot_count
+                else "FAIL",
+                observed_snapshot_count=len(snapshots),
+                expected_snapshot_count=expected_snapshot_count,
+                actual_writing_time_ms=decimal_csv(actual_writing_ms),
+            )
+
+        if snapshots:
+            text_matches = (
+                normalise_text_for_comparison(snapshots[-1].text)
+                == normalise_text_for_comparison(essay_text)
+            )
+            add(
+                "LAST_SNAPSHOT_MATCHES_FINAL_ESSAY",
+                "snapshot",
+                "INFO",
+                "PASS" if text_matches else "FAIL",
+                last_snapshot_minute=snapshots[-1].minute,
+                last_snapshot_word_count=snapshots[-1].cumulative_word_count,
+                final_essay_word_count=essay_word_count,
+                text_equal=text_matches,
+            )
+        else:
+            add(
+                "LAST_SNAPSHOT_MATCHES_FINAL_ESSAY",
+                "snapshot",
+                "INFO",
+                "NOT_CHECKED",
+                reason="no_valid_minute_blocks",
+            )
+
+    add(
+        "KEYSTROKE_FILE_PRESENT",
+        "keystroke",
+        "WARNING",
+        "PASS" if keystroke.info is not None else "FAIL",
+        filename=None if keystroke.info is None else keystroke.info.filename,
+    )
+    add(
+        "KEYSTROKE_COLUMNS_COMPLETE",
+        "keystroke",
+        "ERROR",
+        "PASS" if keystroke.info is not None else "NOT_CHECKED",
+        reason=None if keystroke.info is not None else "keystroke_file_unavailable",
+        required_columns=sorted(KEYSTROKE_REQUIRED_COLUMNS),
+    )
+
+    keystroke_rows: list[dict[str, str]] = []
+    if keystroke.info is not None:
+        keystroke_text = archive.read(keystroke.info).decode("utf-8-sig")
+        keystroke_rows = list(
+            csv.DictReader(io.StringIO(keystroke_text, newline=""))
+        )
+
+    if not keystroke_rows:
+        for rule, category, severity in (
+            ("KEYSTROKE_SUBJECT_CODE_MATCH", "identity", "FLAG"),
+            ("KEYSTROKE_TASK_NUMBER_MATCH", "identity", "FLAG"),
+            ("KEYSTROKE_TOPIC_CODE_MATCH", "identity", "FLAG"),
+            ("KEYSTROKE_CONDITION_LABEL_MATCH", "identity", "FLAG"),
+            ("KEYSTROKE_PLANNING_MODE_MATCH", "identity", "FLAG"),
+            ("KEYSTROKE_FAMILIARITY_MATCH", "identity", "FLAG"),
+            ("KEYSTROKE_WRITING_START_UNIQUE", "keystroke", "WARNING"),
+            ("KEYSTROKE_WRITING_START_AT_ZERO", "keystroke", "WARNING"),
+            ("KEYSTROKE_WRITING_END_UNIQUE", "keystroke", "WARNING"),
+            ("KEYSTROKE_TIME_VALUES_VALID", "keystroke", "ERROR"),
+            ("KEYSTROKE_TIME_MONOTONIC", "keystroke", "WARNING"),
+            ("KEYSTROKE_DUPLICATE_EVENTS_ABSENT", "keystroke", "WARNING"),
+            ("KEYSTROKE_NO_EVENTS_AFTER_WRITING_END", "keystroke", "WARNING"),
+            ("KEYSTROKE_WRITING_END_TIME_MATCH_METADATA", "keystroke", "WARNING"),
+            ("KEYSTROKE_WRITING_END_AFTER_LAST_SNAPSHOT", "keystroke", "WARNING"),
+        ):
+            add(
+                rule,
+                category,
+                severity,
+                "NOT_CHECKED",
+                reason="keystroke_log_unavailable_or_empty",
+            )
+    else:
+        set_match(
+            "KEYSTROKE_SUBJECT_CODE_MATCH",
+            "subject_code",
+            {str(row.get("subject_code", "")) for row in keystroke_rows},
+            participant,
+        )
+        set_match(
+            "KEYSTROKE_TASK_NUMBER_MATCH",
+            "task_number",
+            {str(row.get("task_number", "")) for row in keystroke_rows},
+            task,
+        )
+        set_match(
+            "KEYSTROKE_TOPIC_CODE_MATCH",
+            "topic_code",
+            {str(row.get("topic_code", "")) for row in keystroke_rows},
+            condition,
+            normalise_lower=True,
+        )
+        set_match(
+            "KEYSTROKE_CONDITION_LABEL_MATCH",
+            "condition",
+            {str(row.get("condition", "")) for row in keystroke_rows},
+            metadata.get("condition", ""),
+        )
+        set_match(
+            "KEYSTROKE_PLANNING_MODE_MATCH",
+            "planning_mode",
+            {str(row.get("planning_mode", "")) for row in keystroke_rows},
+            planning_mode,
+            normalise_lower=True,
+        )
+        set_match(
+            "KEYSTROKE_FAMILIARITY_MATCH",
+            "familiarity",
+            {str(row.get("familiarity", "")) for row in keystroke_rows},
+            familiarity,
+            normalise_lower=True,
+        )
+
+        start_indices = [
+            index
+            for index, row in enumerate(keystroke_rows)
+            if row.get("event") == "writing_start"
+        ]
+        end_indices = [
+            index
+            for index, row in enumerate(keystroke_rows)
+            if row.get("event") == "writing_end"
+        ]
+        add(
+            "KEYSTROKE_WRITING_START_UNIQUE",
+            "keystroke",
+            "WARNING",
+            "PASS" if len(start_indices) == 1 else "FAIL",
+            count=len(start_indices),
+            csv_rows=[index + 2 for index in start_indices],
+        )
+        if len(start_indices) == 1:
+            raw_start_time = keystroke_rows[start_indices[0]].get("time_ms", "")
+            try:
+                start_time = Decimal(raw_start_time)
+                start_valid = start_time.is_finite() and start_time == 0
+            except (InvalidOperation, ValueError):
+                start_valid = False
+            add(
+                "KEYSTROKE_WRITING_START_AT_ZERO",
+                "keystroke",
+                "WARNING",
+                "PASS" if start_valid else "FAIL",
+                observed_time_ms=raw_start_time,
+                expected_time_ms="0",
+            )
+        else:
+            add(
+                "KEYSTROKE_WRITING_START_AT_ZERO",
+                "keystroke",
+                "WARNING",
+                "NOT_CHECKED",
+                reason="writing_start_not_unique",
+            )
+
+        add(
+            "KEYSTROKE_WRITING_END_UNIQUE",
+            "keystroke",
+            "WARNING",
+            "PASS" if len(end_indices) == 1 else "FAIL",
+            count=len(end_indices),
+            csv_rows=[index + 2 for index in end_indices],
+        )
+
+        parsed_times: list[Decimal] = []
+        invalid_time_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(keystroke_rows):
+            raw_time = row.get("time_ms", "")
+            try:
+                parsed_time = Decimal(raw_time)
+                if not parsed_time.is_finite() or parsed_time < 0:
+                    raise InvalidOperation
+                parsed_times.append(parsed_time)
+            except (InvalidOperation, ValueError):
+                invalid_time_rows.append(
+                    {"csv_row": index + 2, "value": raw_time}
+                )
+
+        add(
+            "KEYSTROKE_TIME_VALUES_VALID",
+            "keystroke",
+            "ERROR",
+            "PASS" if not invalid_time_rows else "FAIL",
+            invalid_count=len(invalid_time_rows),
+            invalid_rows=invalid_time_rows[:20],
+        )
+
+        if invalid_time_rows:
+            add(
+                "KEYSTROKE_TIME_MONOTONIC",
+                "keystroke",
+                "WARNING",
+                "NOT_CHECKED",
+                reason="one_or_more_invalid_time_values",
+            )
+        else:
+            backwards = [
+                {
+                    "csv_row": index + 2,
+                    "previous_ms": decimal_csv(parsed_times[index - 1]),
+                    "current_ms": decimal_csv(parsed_times[index]),
+                }
+                for index in range(1, len(parsed_times))
+                if parsed_times[index] < parsed_times[index - 1]
+            ]
+            add(
+                "KEYSTROKE_TIME_MONOTONIC",
+                "keystroke",
+                "WARNING",
+                "PASS" if not backwards else "FAIL",
+                backwards_count=len(backwards),
+                first_backwards_events=backwards[:20],
+                equal_timestamps_allowed=True,
+            )
+
+        signature_fields = [
+            "subject_code",
+            "topic_code",
+            "task_number",
+            "condition",
+            "familiarity",
+            "planning_mode",
+            "time_ms",
+            "event",
+            "key",
+            "inputType",
+            "data",
+            "cursor_start",
+            "cursor_end",
+            "word_count",
+        ]
+        signatures = [
+            tuple(row.get(field, "") for field in signature_fields)
+            for row in keystroke_rows
+        ]
+        duplicate_signatures = [
+            {"occurrences": count, "values": dict(zip(signature_fields, sig))}
+            for sig, count in Counter(signatures).items()
+            if count > 1
+        ]
+        add(
+            "KEYSTROKE_DUPLICATE_EVENTS_ABSENT",
+            "keystroke",
+            "WARNING",
+            "PASS" if not duplicate_signatures else "FAIL",
+            duplicated_event_groups=len(duplicate_signatures),
+            duplicated_extra_rows=sum(
+                item["occurrences"] - 1 for item in duplicate_signatures
+            ),
+            first_duplicate_groups=duplicate_signatures[:10],
+        )
+
+        if len(end_indices) == 1:
+            events_after_end = len(keystroke_rows) - end_indices[0] - 1
+            add(
+                "KEYSTROKE_NO_EVENTS_AFTER_WRITING_END",
+                "keystroke",
+                "WARNING",
+                "PASS" if events_after_end == 0 else "FAIL",
+                writing_end_csv_row=end_indices[0] + 2,
+                events_after_writing_end=events_after_end,
+            )
+        else:
+            add(
+                "KEYSTROKE_NO_EVENTS_AFTER_WRITING_END",
+                "keystroke",
+                "WARNING",
+                "NOT_CHECKED",
+                reason="writing_end_not_unique",
+            )
+
+        raw_metadata_time = metadata.get("actual_writing_time_ms")
+        if keystroke.writing_end is None or raw_metadata_time in (None, ""):
+            add(
+                "KEYSTROKE_WRITING_END_TIME_MATCH_METADATA",
+                "keystroke",
+                "WARNING",
+                "NOT_CHECKED",
+                keystroke_time_ms=None
+                if keystroke.writing_end is None
+                else decimal_csv(keystroke.writing_end.elapsed_time_ms),
+                metadata_time_ms=raw_metadata_time,
+                reason="one_or_more_time_sources_unavailable",
+            )
+        else:
+            try:
+                metadata_time = Decimal(str(raw_metadata_time))
+                if not metadata_time.is_finite():
+                    raise InvalidOperation
+                time_difference = abs(
+                    metadata_time - keystroke.writing_end.elapsed_time_ms
+                )
+                add(
+                    "KEYSTROKE_WRITING_END_TIME_MATCH_METADATA",
+                    "keystroke",
+                    "WARNING",
+                    "PASS" if time_difference == 0 else "FAIL",
+                    keystroke_time_ms=decimal_csv(
+                        keystroke.writing_end.elapsed_time_ms
+                    ),
+                    metadata_time_ms=decimal_csv(metadata_time),
+                    absolute_difference_ms=decimal_csv(time_difference),
+                    exact_match_required=True,
+                )
+            except (InvalidOperation, ValueError):
+                add(
+                    "KEYSTROKE_WRITING_END_TIME_MATCH_METADATA",
+                    "keystroke",
+                    "WARNING",
+                    "NOT_CHECKED",
+                    metadata_time_ms=raw_metadata_time,
+                    reason="invalid_metadata_actual_writing_time_ms",
+                )
+
+        if keystroke.writing_end is None or not snapshots:
+            add(
+                "KEYSTROKE_WRITING_END_AFTER_LAST_SNAPSHOT",
+                "keystroke",
+                "WARNING",
+                "NOT_CHECKED",
+                writing_end_available=keystroke.writing_end is not None,
+                snapshot_count=len(snapshots),
+                reason="writing_end_or_snapshot_unavailable",
+            )
+        else:
+            last_snapshot_ms = Decimal(snapshots[-1].minute * 60_000)
+            endpoint_after_snapshot = (
+                keystroke.writing_end.elapsed_time_ms >= last_snapshot_ms
+            )
+            add(
+                "KEYSTROKE_WRITING_END_AFTER_LAST_SNAPSHOT",
+                "keystroke",
+                "WARNING",
+                "PASS" if endpoint_after_snapshot else "FAIL",
+                writing_end_time_ms=decimal_csv(
+                    keystroke.writing_end.elapsed_time_ms
+                ),
+                last_snapshot_minute=snapshots[-1].minute,
+                last_snapshot_time_ms=decimal_csv(last_snapshot_ms),
+            )
+
+    ai_condition = planning_mode == "a"
+    chat_presence_matches = (ai_condition and chat_info is not None) or (
+        not ai_condition and chat_info is None
+    )
+    add(
+        "AI_CHAT_PRESENCE_MATCHES_CONDITION",
+        "ai_chat",
+        "WARNING",
+        "PASS" if chat_presence_matches else "FAIL",
+        planning_mode=planning_mode,
+        chat_present=chat_info is not None,
+        expected_chat_present=ai_condition,
+    )
+    add(
+        "AI_CHAT_JSON_VALID",
+        "ai_chat",
+        "ERROR",
+        "PASS" if chat_info is not None else "NOT_CHECKED",
+        filename=None if chat_info is None else chat_info.filename,
+        reason=None if chat_info is not None else "ai_chat_log_unavailable",
+    )
+
+    if chat_data is None:
+        for rule in (
+            "AI_CHAT_SUBJECT_CODE_MATCH",
+            "AI_CHAT_TASK_NUMBER_MATCH",
+            "AI_CHAT_TOPIC_CODE_MATCH",
+            "AI_CHAT_CONDITION_LABEL_MATCH",
+        ):
+            add(
+                rule,
+                "identity",
+                "FLAG",
+                "NOT_CHECKED",
+                reason="ai_chat_log_unavailable",
+                expected_for_planning_mode=ai_condition,
+            )
+    else:
+        scalar_match(
+            "AI_CHAT_SUBJECT_CODE_MATCH",
+            "ai_chat",
+            "subject_code",
+            chat_data.get("subject_code"),
+            participant,
+        )
+        scalar_match(
+            "AI_CHAT_TASK_NUMBER_MATCH",
+            "ai_chat",
+            "task_number",
+            chat_data.get("task_number"),
+            task,
+        )
+        scalar_match(
+            "AI_CHAT_TOPIC_CODE_MATCH",
+            "ai_chat",
+            "topic_code",
+            chat_data.get("topic_code"),
+            condition,
+            normalise_lower=True,
+        )
+        scalar_match(
+            "AI_CHAT_CONDITION_LABEL_MATCH",
+            "ai_chat",
+            "condition",
+            chat_data.get("condition"),
+            metadata.get("condition", ""),
+        )
+
+    return rows
 
 
 def build_timeseries_rows(
@@ -842,45 +2032,45 @@ def build_timeseries_rows(
 
 def process_zip(path: Path) -> ParsedPackage:
     """Process one Gamma ZIP directly in read-only mode."""
-    warnings: list[str] = []
+    participant = ""
+    task: int | str = ""
+    condition = ""
 
     try:
         with zipfile.ZipFile(path, "r") as archive:
             corrupt_member = archive.testzip()
 
             if corrupt_member is not None:
-                raise PackageError(f"CRC failure in member: {corrupt_member}")
+                raise PackageError(
+                    f"CRC failure in member: {corrupt_member}",
+                    rule="ARCHIVE_CRC_VALID",
+                    evidence={"corrupt_member": corrupt_member},
+                )
 
             all_members = archive.infolist()
             members = [info for info in all_members if is_research_member(info)]
-            ignored_count = sum(
-                1 for info in all_members if not is_research_member(info)
-            )
-
-            if ignored_count:
-                warnings.append(
-                    f"ignored_system_or_directory_entries={ignored_count}"
-                )
-
-            unsafe_paths = [
-                info.filename
-                for info in members
-                if unsafe_member_path(info.filename)
-            ]
-
-            if unsafe_paths:
-                warnings.append("unsafe_member_paths_present_not_extracted")
 
             metadata_matches = metadata_candidates(archive, members)
 
             if not metadata_matches:
                 raise PackageError(
-                    "Missing metadata JSON with required identity fields"
+                    "Missing metadata JSON with required identity fields",
+                    rule="METADATA_PRESENT_UNIQUE",
+                    evidence={"candidate_count": 0},
                 )
 
             if len(metadata_matches) > 1:
                 names = ", ".join(info.filename for info, _ in metadata_matches)
-                raise PackageError(f"Multiple metadata candidates: {names}")
+                raise PackageError(
+                    f"Multiple metadata candidates: {names}",
+                    rule="METADATA_PRESENT_UNIQUE",
+                    evidence={
+                        "candidate_count": len(metadata_matches),
+                        "candidates": [
+                            info.filename for info, _ in metadata_matches
+                        ],
+                    },
+                )
 
             metadata_info, metadata = metadata_matches[0]
             (
@@ -890,20 +2080,6 @@ def process_zip(path: Path) -> ParsedPackage:
                 planning_mode,
                 familiarity,
             ) = validate_identity(metadata)
-
-            expected_condition = planning_mode + familiarity
-
-            if condition != expected_condition:
-                warnings.append(
-                    "condition_code_mismatch"
-                    f"(topic_code={condition},derived={expected_condition})"
-                )
-
-            if planning_mode not in {"a", "i", "n"}:
-                warnings.append(f"unexpected_planning_mode={planning_mode}")
-
-            if familiarity not in {"h", "l"}:
-                warnings.append(f"unexpected_familiarity={familiarity}")
 
             final_info, essay_bytes = find_final_essay(archive, members)
             essay_text = essay_bytes.decode("utf-8")
@@ -915,7 +2091,6 @@ def process_zip(path: Path) -> ParsedPackage:
                 task,
                 condition,
             )
-            warnings.extend(keystroke.warnings)
 
             (
                 snapshot_info,
@@ -929,7 +2104,6 @@ def process_zip(path: Path) -> ParsedPackage:
                 task,
                 condition,
             )
-            warnings.extend(snapshot_warnings)
 
             chat_info, chat_data = find_chat_log(
                 archive,
@@ -938,89 +2112,27 @@ def process_zip(path: Path) -> ParsedPackage:
             )
             ai_chat_present = chat_info is not None
 
-            if planning_mode == "a" and not ai_chat_present:
-                warnings.append("ai_condition_missing_chat_log")
-
-            if planning_mode != "a" and ai_chat_present:
-                warnings.append("non_ai_condition_has_chat_log")
-
-            metadata_word_count = metadata.get("final_word_count")
-            computed_word_count = count_words(essay_text)
-
-            if metadata_word_count is None:
-                warnings.append("missing_final_word_count")
-            else:
-                try:
-                    if int(metadata_word_count) != computed_word_count:
-                        warnings.append(
-                            "word_count_mismatch"
-                            f"(metadata={metadata_word_count},"
-                            f"computed={computed_word_count})"
-                        )
-                except (TypeError, ValueError):
-                    warnings.append(
-                        f"invalid_final_word_count={metadata_word_count!r}"
-                    )
-
-            if keystroke.writing_end is not None:
-                if (
-                    keystroke.writing_end.cumulative_word_count
-                    != computed_word_count
-                ):
-                    warnings.append(
-                        "keystroke_final_word_count_mismatch"
-                        f"(keystroke="
-                        f"{keystroke.writing_end.cumulative_word_count},"
-                        f"computed={computed_word_count})"
-                    )
-
-                metadata_time = metadata.get("actual_writing_time_ms")
-                if metadata_time not in (None, ""):
-                    try:
-                        metadata_time_decimal = Decimal(str(metadata_time))
-                        if not metadata_time_decimal.is_finite():
-                            raise InvalidOperation
-                        difference = abs(
-                            metadata_time_decimal
-                            - keystroke.writing_end.elapsed_time_ms
-                        )
-                        if difference > Decimal("1"):
-                            warnings.append(
-                                "keystroke_writing_end_time_mismatch"
-                                f"(keystroke_ms="
-                                f"{decimal_csv(keystroke.writing_end.elapsed_time_ms)},"
-                                f"metadata_ms={metadata_time},"
-                                f"difference_ms={decimal_csv(difference)})"
-                            )
-                    except (InvalidOperation, ValueError):
-                        warnings.append(
-                            f"invalid_actual_writing_time_ms={metadata_time!r}"
-                        )
-
-                if snapshots:
-                    last_snapshot_time = Decimal(snapshots[-1].minute * 60_000)
-                    if keystroke.writing_end.elapsed_time_ms < last_snapshot_time:
-                        warnings.append(
-                            "keystroke_writing_end_precedes_last_snapshot"
-                            f"(writing_end_ms="
-                            f"{decimal_csv(keystroke.writing_end.elapsed_time_ms)},"
-                            f"last_snapshot_ms={decimal_csv(last_snapshot_time)})"
-                        )
-
-            if snapshots and (
-                normalise_text_for_comparison(snapshots[-1].text)
-                != normalise_text_for_comparison(essay_text)
-            ):
-                warnings.append("last_snapshot_differs_from_final_essay")
-
-            if chat_data is not None:
-                for key, expected in (
-                    ("subject_code", participant),
-                    ("task_number", task),
-                    ("topic_code", condition),
-                ):
-                    if key in chat_data and str(chat_data[key]) != str(expected):
-                        warnings.append(f"chat_{key}_mismatch")
+            qc_rows = build_qc_rows(
+                archive,
+                all_members,
+                members,
+                metadata_info,
+                metadata,
+                final_info,
+                essay_text,
+                keystroke,
+                snapshot_info,
+                snapshots,
+                chat_info,
+                chat_data,
+                participant,
+                int(task),
+                condition,
+                planning_mode,
+                familiarity,
+                path.name,
+            )
+            warnings_summary = qc_summary(qc_rows)
 
             raw_filename = f"{participant}_task{task}_{condition}.txt"
             fingerprint = research_fingerprint(
@@ -1096,7 +2208,7 @@ def process_zip(path: Path) -> ParsedPackage:
                 "ai_chat_present": ai_chat_present,
                 "source_zip": path.name,
                 "raw_text_file": f"texts_raw/{raw_filename}",
-                "warnings": " | ".join(warnings),
+                "warnings": warnings_summary,
             }
 
             return ParsedPackage(
@@ -1105,13 +2217,69 @@ def process_zip(path: Path) -> ParsedPackage:
                 timeseries_rows=timeseries_rows,
                 essay_bytes=essay_bytes,
                 research_sha256=fingerprint,
-                warnings=warnings,
+                warnings=[warnings_summary] if warnings_summary else [],
+                qc_rows=qc_rows,
             )
 
+    except PackageError as exc:
+        exc.participant = participant
+        exc.task = task
+        exc.condition = condition
+        if not exc.qc_rows:
+            exc.qc_rows = [
+                make_qc_row(
+                    path.name,
+                    participant,
+                    task,
+                    condition,
+                    exc.rule,
+                    exc.category,
+                    exc.severity,
+                    "FAIL",
+                    **exc.evidence,
+                )
+            ]
+        raise
     except zipfile.BadZipFile as exc:
-        raise PackageError(f"Invalid ZIP archive: {exc}") from exc
+        error = PackageError(
+            f"Invalid ZIP archive: {exc}",
+            rule="ARCHIVE_READABLE",
+            evidence={"error": str(exc)},
+        )
+        error.qc_rows = [
+            make_qc_row(
+                path.name,
+                "",
+                "",
+                "",
+                error.rule,
+                error.category,
+                error.severity,
+                "FAIL",
+                **error.evidence,
+            )
+        ]
+        raise error from exc
     except OSError as exc:
-        raise PackageError(f"Cannot read ZIP archive: {exc}") from exc
+        error = PackageError(
+            f"Cannot read ZIP archive: {exc}",
+            rule="ARCHIVE_READABLE",
+            evidence={"error": str(exc)},
+        )
+        error.qc_rows = [
+            make_qc_row(
+                path.name,
+                "",
+                "",
+                "",
+                error.rule,
+                error.category,
+                error.severity,
+                "FAIL",
+                **error.evidence,
+            )
+        ]
+        raise error from exc
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
@@ -1198,6 +2366,7 @@ def process_batch(
     manifest_rows: list[dict[str, Any]] = []
     report_rows: list[dict[str, Any]] = []
     timeseries_rows: list[dict[str, Any]] = []
+    qc_rows: list[dict[str, Any]] = []
     seen: dict[tuple[str, int, str], ParsedPackage] = {}
 
     processed = 0
@@ -1218,6 +2387,21 @@ def process_batch(
             if previous is not None:
                 if previous.research_sha256 == package.research_sha256:
                     duplicates += 1
+                    qc_rows.append(
+                        make_qc_row(
+                            zip_path.name,
+                            row["participant"],
+                            row["task"],
+                            row["condition"],
+                            "DUPLICATE_PACKAGE_IDENTICAL",
+                            "batch",
+                            "INFO",
+                            "FAIL",
+                            original_source_zip=previous.source_zip.name,
+                            duplicate_source_zip=zip_path.name,
+                            action="no_second_manifest_or_timeseries_rows",
+                        )
+                    )
                     report_rows.append(
                         {
                             "source_zip": zip_path.name,
@@ -1228,21 +2412,45 @@ def process_batch(
                             "raw_text_file": previous.manifest_row[
                                 "raw_text_file"
                             ],
-                            "warnings": (
-                                "identical participant-task-condition "
-                                "already processed; no second manifest "
-                                "or time-series rows"
-                            ),
+                            "warnings": "",
                             "error": "",
                         }
                     )
                     continue
 
-                raise PackageError(
+                failed += 1
+                conflict_message = (
                     "Conflicting packages share participant-task-condition "
                     "but have different research contents: "
                     f"{previous.source_zip.name} and {zip_path.name}"
                 )
+                qc_rows.append(
+                    make_qc_row(
+                        zip_path.name,
+                        row["participant"],
+                        row["task"],
+                        row["condition"],
+                        "DUPLICATE_PACKAGE_CONFLICT",
+                        "batch",
+                        "ERROR",
+                        "FAIL",
+                        original_source_zip=previous.source_zip.name,
+                        conflicting_source_zip=zip_path.name,
+                    )
+                )
+                report_rows.append(
+                    {
+                        "source_zip": zip_path.name,
+                        "status": "error",
+                        "participant": row["participant"],
+                        "task": row["task"],
+                        "condition": row["condition"],
+                        "raw_text_file": "",
+                        "warnings": "qc_findings=1; qc_max_severity=ERROR",
+                        "error": conflict_message,
+                    }
+                )
+                continue
 
             raw_path = output_path / str(row["raw_text_file"])
             atomic_write_bytes(raw_path, package.essay_bytes)
@@ -1250,6 +2458,7 @@ def process_batch(
             seen[identity] = package
             manifest_rows.append(row)
             timeseries_rows.extend(package.timeseries_rows)
+            qc_rows.extend(package.qc_rows)
             processed += 1
 
             report_rows.append(
@@ -1267,15 +2476,16 @@ def process_batch(
 
         except PackageError as exc:
             failed += 1
+            qc_rows.extend(exc.qc_rows)
             report_rows.append(
                 {
                     "source_zip": zip_path.name,
                     "status": "error",
-                    "participant": "",
-                    "task": "",
-                    "condition": "",
+                    "participant": exc.participant,
+                    "task": exc.task,
+                    "condition": exc.condition,
                     "raw_text_file": "",
-                    "warnings": "",
+                    "warnings": "qc_findings=1; qc_max_severity=ERROR",
                     "error": str(exc),
                 }
             )
@@ -1296,14 +2506,28 @@ def process_batch(
             int(row["_observation_sequence"]),
         )
     )
+    qc_rows.sort(
+        key=lambda row: (
+            str(row["participant"]),
+            str(row["task"]),
+            str(row["condition"]),
+            str(row["source_zip"]).casefold(),
+            str(row["category"]),
+            str(row["rule"]),
+            str(row["result"]),
+            str(row["evidence"]),
+        )
+    )
 
     manifest_path = output_path / "manifest.csv"
     report_path = output_path / "processing_report.csv"
     timeseries_path = output_path / "writing_timeseries.csv"
+    qc_path = output_path / "qc_report.csv"
 
     atomic_write_csv(manifest_path, MANIFEST_FIELDS, manifest_rows)
     atomic_write_csv(report_path, REPORT_FIELDS, report_rows)
     atomic_write_csv(timeseries_path, TIMESERIES_FIELDS, timeseries_rows)
+    atomic_write_csv(qc_path, QC_FIELDS, qc_rows)
 
     return BatchSummary(
         discovered=len(zip_paths),
@@ -1314,6 +2538,7 @@ def process_batch(
         manifest_path=manifest_path,
         report_path=report_path,
         timeseries_path=timeseries_path,
+        qc_path=qc_path,
     )
 
 
@@ -1322,7 +2547,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         prog="mtdps",
         description=(
             "Read Gamma ZIP data packages and export manifest.csv, raw "
-            "essays, and writing_timeseries.csv."
+            "essays, writing_timeseries.csv, and qc_report.csv."
         ),
     )
 
@@ -1374,6 +2599,7 @@ def main() -> int:
     print(f"Manifest: {summary.manifest_path}")
     print(f"Processing report: {summary.report_path}")
     print(f"Writing time series: {summary.timeseries_path}")
+    print(f"QC report: {summary.qc_path}")
 
     return 1 if summary.failed else 0
 
