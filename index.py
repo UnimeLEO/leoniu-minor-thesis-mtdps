@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MTDPS v0.3.0 — Minor Thesis Data Processing System."""
+"""MTDPS v0.3.1 — Minor Thesis Data Processing System."""
 
 from __future__ import annotations
 
@@ -19,7 +19,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
+
+WRITING_TIME_TOLERANCE_MS = Decimal("10")
+LARGE_INSERTION_THRESHOLD_CHARS = 50
+BULK_REPLACEMENT_THRESHOLD_CHARS = 20
 
 DEFAULT_INPUT_DIR = Path(
     r"D:\Data\Desktop\研二上\MT1-90043\202608-Participant Data"
@@ -94,7 +98,7 @@ QC_FIELDS = [
 ]
 
 QC_SEVERITIES = {"INFO", "WARNING", "FLAG", "ERROR"}
-QC_RESULTS = {"PASS", "FAIL", "NOT_CHECKED"}
+QC_RESULTS = {"PASS", "FAIL", "NOT_CHECKED", "NOT_APPLICABLE"}
 SEVERITY_RANK = {
     "INFO": 0,
     "WARNING": 1,
@@ -203,6 +207,20 @@ class KeystrokeResult:
     row_count: int | None
     writing_end: WritingEndObservation | None
     warnings: list[str]
+
+
+@dataclass(frozen=True)
+class KeystrokeReplayResult:
+    """Result and diagnostics from replaying confirmed text-edit events."""
+
+    text: str
+    applied_events: int
+    input_events_without_beforeinput: list[dict[str, Any]]
+    unsupported_events: list[dict[str, Any]]
+    invalid_cursor_events: list[dict[str, Any]]
+    large_insertions: list[dict[str, Any]]
+    bulk_replacements: list[dict[str, Any]]
+    paste_or_drop_events: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -656,6 +674,240 @@ def count_words(text: str) -> int:
     return len(re.findall(r"\S+", text))
 
 
+def utf16_length(text: str) -> int:
+    """Return the number of UTF-16 code units used by browser offsets."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def python_index_from_utf16(text: str, offset: int) -> int | None:
+    """Translate a browser UTF-16 offset to a Python string index."""
+    if offset < 0:
+        return None
+
+    consumed = 0
+    for index, character in enumerate(text):
+        if consumed == offset:
+            return index
+        consumed += 2 if ord(character) > 0xFFFF else 1
+        if consumed > offset:
+            return None
+
+    return len(text) if consumed == offset else None
+
+
+def text_sha256(text: str) -> str:
+    """Hash Unicode text using its UTF-8 representation."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def first_text_difference(first: str, second: str) -> dict[str, Any] | None:
+    """Describe the first exact character difference between two texts."""
+    shared_length = min(len(first), len(second))
+    index = next(
+        (
+            position
+            for position in range(shared_length)
+            if first[position] != second[position]
+        ),
+        shared_length,
+    )
+    if index == shared_length and len(first) == len(second):
+        return None
+
+    return {
+        "python_index": index,
+        "utf16_offset": utf16_length(first[:index]),
+        "reconstructed_character": (
+            None if index >= len(first) else first[index]
+        ),
+        "final_essay_character": (
+            None if index >= len(second) else second[index]
+        ),
+    }
+
+
+def replay_keystroke_text(
+    rows: list[dict[str, str]],
+) -> KeystrokeReplayResult:
+    """Rebuild text from confirmed beforeinput/input edit pairs."""
+    text = ""
+    applied_events = 0
+    missing_beforeinput: list[dict[str, Any]] = []
+    unsupported: list[dict[str, Any]] = []
+    invalid_cursors: list[dict[str, Any]] = []
+    large_insertions: list[dict[str, Any]] = []
+    bulk_replacements: list[dict[str, Any]] = []
+    paste_or_drop_events: list[dict[str, Any]] = []
+
+    insertion_types = {
+        "insertText",
+        "insertCompositionText",
+        "insertReplacementText",
+        "insertFromPaste",
+        "insertFromPasteAsQuotation",
+        "insertFromDrop",
+        "insertFromYank",
+    }
+    line_break_types = {"insertLineBreak", "insertParagraph"}
+    selection_delete_types = {
+        "deleteByCut",
+        "deleteByDrag",
+        "deleteContent",
+    }
+    paste_drop_types = {
+        "insertFromPaste",
+        "insertFromPasteAsQuotation",
+        "insertFromDrop",
+        "insertFromYank",
+    }
+
+    for input_index, input_row in enumerate(rows):
+        if input_row.get("event") != "input":
+            continue
+
+        before_index = input_index - 1
+        before_row = rows[before_index] if before_index >= 0 else None
+        chain_matches = (
+            before_row is not None
+            and before_row.get("event") == "beforeinput"
+            and before_row.get("inputType") == input_row.get("inputType")
+            and before_row.get("data") == input_row.get("data")
+        )
+        if not chain_matches:
+            missing_beforeinput.append(
+                {
+                    "csv_row": input_index + 2,
+                    "time_ms": input_row.get("time_ms", ""),
+                    "input_type": input_row.get("inputType", ""),
+                    "data_sha256": text_sha256(input_row.get("data", "")),
+                    "preceding_event": (
+                        None if before_row is None else before_row.get("event")
+                    ),
+                }
+            )
+            continue
+
+        assert before_row is not None
+        input_type = before_row.get("inputType", "")
+        csv_row = before_index + 2
+        try:
+            cursor_start = int(before_row.get("cursor_start", ""))
+            cursor_end = int(before_row.get("cursor_end", ""))
+        except (TypeError, ValueError):
+            invalid_cursors.append(
+                {
+                    "csv_row": csv_row,
+                    "input_csv_row": input_index + 2,
+                    "cursor_start": before_row.get("cursor_start"),
+                    "cursor_end": before_row.get("cursor_end"),
+                    "text_utf16_length": utf16_length(text),
+                    "reason": "cursor_not_an_integer",
+                }
+            )
+            continue
+
+        start_index = python_index_from_utf16(text, cursor_start)
+        end_index = python_index_from_utf16(text, cursor_end)
+        if (
+            start_index is None
+            or end_index is None
+            or cursor_start > cursor_end
+        ):
+            invalid_cursors.append(
+                {
+                    "csv_row": csv_row,
+                    "input_csv_row": input_index + 2,
+                    "cursor_start": cursor_start,
+                    "cursor_end": cursor_end,
+                    "text_utf16_length": utf16_length(text),
+                    "reason": "cursor_out_of_range_or_split_surrogate",
+                }
+            )
+            continue
+
+        replacement_start = start_index
+        replacement_end = end_index
+        inserted_text = ""
+        if input_type in insertion_types:
+            inserted_text = before_row.get("data", "")
+        elif input_type in line_break_types:
+            inserted_text = "\n"
+        elif input_type == "deleteContentBackward":
+            if start_index == end_index and start_index > 0:
+                replacement_start -= 1
+        elif input_type == "deleteContentForward":
+            if start_index == end_index and end_index < len(text):
+                replacement_end += 1
+        elif input_type in selection_delete_types:
+            pass
+        else:
+            unsupported.append(
+                {
+                    "csv_row": csv_row,
+                    "input_csv_row": input_index + 2,
+                    "time_ms": before_row.get("time_ms", ""),
+                    "input_type": input_type,
+                }
+            )
+            continue
+
+        removed_text = text[replacement_start:replacement_end]
+        event_evidence = {
+            "csv_row": csv_row,
+            "input_csv_row": input_index + 2,
+            "time_ms": before_row.get("time_ms", ""),
+            "input_type": input_type,
+            "cursor_start": cursor_start,
+            "cursor_end": cursor_end,
+            "inserted_character_count": len(inserted_text),
+            "removed_character_count": len(removed_text),
+            "inserted_text_sha256": text_sha256(inserted_text),
+        }
+
+        if len(inserted_text) >= LARGE_INSERTION_THRESHOLD_CHARS:
+            large_insertions.append(event_evidence.copy())
+
+        if (
+            inserted_text
+            and len(removed_text) >= BULK_REPLACEMENT_THRESHOLD_CHARS
+        ):
+            bulk_replacements.append(event_evidence.copy())
+
+        if input_type in paste_drop_types:
+            internal_occurrences = text.count(inserted_text) if inserted_text else 0
+            source_assessment = (
+                "possibly_internal_copy"
+                if internal_occurrences > 0
+                else "source_unknown_or_external"
+            )
+            paste_evidence = event_evidence.copy()
+            paste_evidence.update(
+                {
+                    "source_assessment": source_assessment,
+                    "preexisting_occurrences": internal_occurrences,
+                }
+            )
+            paste_or_drop_events.append(paste_evidence)
+
+        text = (
+            text[:replacement_start]
+            + inserted_text
+            + text[replacement_end:]
+        )
+        applied_events += 1
+
+    return KeystrokeReplayResult(
+        text=text,
+        applied_events=applied_events,
+        input_events_without_beforeinput=missing_beforeinput,
+        unsupported_events=unsupported,
+        invalid_cursor_events=invalid_cursors,
+        large_insertions=large_insertions,
+        bulk_replacements=bulk_replacements,
+        paste_or_drop_events=paste_or_drop_events,
+    )
+
+
 def parse_snapshot_text(
     text: str,
     participant: str,
@@ -874,9 +1126,11 @@ def find_chat_log(
     archive: zipfile.ZipFile,
     members: list[zipfile.ZipInfo],
     metadata_info: zipfile.ZipInfo,
+    *,
+    content_applicable: bool,
 ) -> tuple[zipfile.ZipInfo | None, dict[str, Any] | None]:
-    """Identify an AI chat JSON by the presence of a chat array."""
-    candidates: list[tuple[zipfile.ZipInfo, dict[str, Any]]] = []
+    """Identify an AI chat JSON without validating irrelevant content."""
+    candidates: list[tuple[zipfile.ZipInfo, dict[str, Any] | None]] = []
 
     for info in members:
         if info.filename == metadata_info.filename:
@@ -889,17 +1143,21 @@ def find_chat_log(
             value = json.loads(archive.read(info).decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             if "chat" in info.filename.lower():
-                raise PackageError(
-                    f"Invalid chat JSON: {info.filename}",
-                    rule="AI_CHAT_JSON_VALID",
-                    category="ai_chat",
-                    evidence={"filename": info.filename},
-                )
+                if content_applicable:
+                    raise PackageError(
+                        f"Invalid chat JSON: {info.filename}",
+                        rule="AI_CHAT_JSON_VALID",
+                        category="ai_chat",
+                        evidence={"filename": info.filename},
+                    )
+                candidates.append((info, None))
 
             continue
 
         if isinstance(value, dict) and isinstance(value.get("chat"), list):
             candidates.append((info, value))
+        elif not content_applicable and "chat" in info.filename.lower():
+            candidates.append((info, None))
 
     if len(candidates) > 1:
         names = ", ".join(info.filename for info, _ in candidates)
@@ -1592,6 +1850,28 @@ def build_qc_rows(
             ("KEYSTROKE_TIME_VALUES_VALID", "keystroke", "ERROR"),
             ("KEYSTROKE_TIME_MONOTONIC", "keystroke", "WARNING"),
             ("KEYSTROKE_DUPLICATE_EVENTS_ABSENT", "keystroke", "WARNING"),
+            (
+                "KEYSTROKE_INPUT_EVENTS_HAVE_BEFOREINPUT",
+                "keystroke",
+                "WARNING",
+            ),
+            (
+                "KEYSTROKE_REPLAY_EVENTS_INTERPRETABLE",
+                "keystroke",
+                "WARNING",
+            ),
+            (
+                "KEYSTROKE_RECONSTRUCTED_FINAL_TEXT_MATCH",
+                "keystroke",
+                "FLAG",
+            ),
+            (
+                "KEYSTROKE_UNUSUALLY_LARGE_INSERTIONS",
+                "editing",
+                "FLAG",
+            ),
+            ("KEYSTROKE_BULK_REPLACEMENTS", "editing", "FLAG"),
+            ("KEYSTROKE_PASTE_OR_DROP_INSERTION", "editing", "INFO"),
             ("KEYSTROKE_NO_EVENTS_AFTER_WRITING_END", "keystroke", "WARNING"),
             ("KEYSTROKE_WRITING_END_TIME_MATCH_METADATA", "keystroke", "WARNING"),
             ("KEYSTROKE_WRITING_END_AFTER_LAST_SNAPSHOT", "keystroke", "WARNING"),
@@ -1783,6 +2063,135 @@ def build_qc_rows(
             first_duplicate_groups=duplicate_signatures[:10],
         )
 
+        replay = replay_keystroke_text(keystroke_rows)
+        missing_chains = replay.input_events_without_beforeinput
+        add(
+            "KEYSTROKE_INPUT_EVENTS_HAVE_BEFOREINPUT",
+            "keystroke",
+            "WARNING",
+            "PASS" if not missing_chains else "FAIL",
+            input_events_without_matching_beforeinput=len(missing_chains),
+            first_events=missing_chains[:20],
+            pairing_rule=(
+                "immediately_preceding beforeinput has same inputType and data"
+            ),
+        )
+
+        replay_interpretable = not (
+            replay.unsupported_events or replay.invalid_cursor_events
+        )
+        add(
+            "KEYSTROKE_REPLAY_EVENTS_INTERPRETABLE",
+            "keystroke",
+            "WARNING",
+            "PASS" if replay_interpretable else "FAIL",
+            applied_edit_events=replay.applied_events,
+            unsupported_event_count=len(replay.unsupported_events),
+            unsupported_events=replay.unsupported_events[:20],
+            invalid_cursor_event_count=len(replay.invalid_cursor_events),
+            invalid_cursor_events=replay.invalid_cursor_events[:20],
+            browser_cursor_unit="UTF-16 code unit",
+        )
+
+        replay_complete = replay_interpretable and not missing_chains
+        if replay_complete:
+            reconstructed_matches = replay.text == essay_text
+            add(
+                "KEYSTROKE_RECONSTRUCTED_FINAL_TEXT_MATCH",
+                "keystroke",
+                "FLAG",
+                "PASS" if reconstructed_matches else "FAIL",
+                exact_match_required=True,
+                applied_edit_events=replay.applied_events,
+                reconstructed_character_count=len(replay.text),
+                final_essay_character_count=len(essay_text),
+                reconstructed_utf16_length=utf16_length(replay.text),
+                final_essay_utf16_length=utf16_length(essay_text),
+                reconstructed_sha256=text_sha256(replay.text),
+                final_essay_sha256=text_sha256(essay_text),
+                first_difference=first_text_difference(replay.text, essay_text),
+            )
+        else:
+            add(
+                "KEYSTROKE_RECONSTRUCTED_FINAL_TEXT_MATCH",
+                "keystroke",
+                "FLAG",
+                "NOT_CHECKED",
+                reason="replay_incomplete",
+                input_events_without_beforeinput=len(missing_chains),
+                unsupported_event_count=len(replay.unsupported_events),
+                invalid_cursor_event_count=len(replay.invalid_cursor_events),
+                reconstructed_character_count=len(replay.text),
+                final_essay_character_count=len(essay_text),
+            )
+
+        if replay.large_insertions:
+            for event in replay.large_insertions:
+                add(
+                    "KEYSTROKE_UNUSUALLY_LARGE_INSERTIONS",
+                    "editing",
+                    "FLAG",
+                    "FAIL",
+                    threshold_character_count=(
+                        LARGE_INSERTION_THRESHOLD_CHARS
+                    ),
+                    **event,
+                )
+        else:
+            add(
+                "KEYSTROKE_UNUSUALLY_LARGE_INSERTIONS",
+                "editing",
+                "FLAG",
+                "PASS",
+                threshold_character_count=LARGE_INSERTION_THRESHOLD_CHARS,
+                detected_count=0,
+            )
+
+        if replay.bulk_replacements:
+            for event in replay.bulk_replacements:
+                add(
+                    "KEYSTROKE_BULK_REPLACEMENTS",
+                    "editing",
+                    "FLAG",
+                    "FAIL",
+                    threshold_removed_character_count=(
+                        BULK_REPLACEMENT_THRESHOLD_CHARS
+                    ),
+                    **event,
+                )
+        else:
+            add(
+                "KEYSTROKE_BULK_REPLACEMENTS",
+                "editing",
+                "FLAG",
+                "PASS",
+                threshold_removed_character_count=(
+                    BULK_REPLACEMENT_THRESHOLD_CHARS
+                ),
+                detected_count=0,
+            )
+
+        if replay.paste_or_drop_events:
+            for event in replay.paste_or_drop_events:
+                source_unknown = (
+                    event["source_assessment"] == "source_unknown_or_external"
+                )
+                add(
+                    "KEYSTROKE_PASTE_OR_DROP_INSERTION",
+                    "editing",
+                    "FLAG" if source_unknown else "INFO",
+                    "FAIL",
+                    **event,
+                )
+        else:
+            add(
+                "KEYSTROKE_PASTE_OR_DROP_INSERTION",
+                "editing",
+                "INFO",
+                "PASS",
+                detected_count=0,
+            )
+
         if len(end_indices) == 1:
             events_after_end = len(keystroke_rows) - end_indices[0] - 1
             add(
@@ -1827,13 +2236,16 @@ def build_qc_rows(
                     "KEYSTROKE_WRITING_END_TIME_MATCH_METADATA",
                     "keystroke",
                     "WARNING",
-                    "PASS" if time_difference == 0 else "FAIL",
+                    "PASS"
+                    if time_difference <= WRITING_TIME_TOLERANCE_MS
+                    else "FAIL",
                     keystroke_time_ms=decimal_csv(
                         keystroke.writing_end.elapsed_time_ms
                     ),
                     metadata_time_ms=decimal_csv(metadata_time),
                     absolute_difference_ms=decimal_csv(time_difference),
-                    exact_match_required=True,
+                    tolerance_ms=decimal_csv(WRITING_TIME_TOLERANCE_MS),
+                    comparison="absolute_difference_ms <= tolerance_ms",
                 )
             except (InvalidOperation, ValueError):
                 add(
@@ -1885,16 +2297,38 @@ def build_qc_rows(
         chat_present=chat_info is not None,
         expected_chat_present=ai_condition,
     )
-    add(
-        "AI_CHAT_JSON_VALID",
-        "ai_chat",
-        "ERROR",
-        "PASS" if chat_info is not None else "NOT_CHECKED",
-        filename=None if chat_info is None else chat_info.filename,
-        reason=None if chat_info is not None else "ai_chat_log_unavailable",
-    )
-
-    if chat_data is None:
+    if not ai_condition:
+        add(
+            "AI_CHAT_JSON_VALID",
+            "ai_chat",
+            "ERROR",
+            "NOT_APPLICABLE",
+            planning_mode=planning_mode,
+            reason="ai_chat_content_not_applicable_to_non_ai_condition",
+        )
+        for rule in (
+            "AI_CHAT_SUBJECT_CODE_MATCH",
+            "AI_CHAT_TASK_NUMBER_MATCH",
+            "AI_CHAT_TOPIC_CODE_MATCH",
+            "AI_CHAT_CONDITION_LABEL_MATCH",
+        ):
+            add(
+                rule,
+                "identity",
+                "FLAG",
+                "NOT_APPLICABLE",
+                planning_mode=planning_mode,
+                reason="ai_chat_content_not_applicable_to_non_ai_condition",
+            )
+    elif chat_data is None:
+        add(
+            "AI_CHAT_JSON_VALID",
+            "ai_chat",
+            "ERROR",
+            "NOT_CHECKED",
+            filename=None,
+            reason="required_ai_chat_log_unavailable",
+        )
         for rule in (
             "AI_CHAT_SUBJECT_CODE_MATCH",
             "AI_CHAT_TASK_NUMBER_MATCH",
@@ -1906,10 +2340,16 @@ def build_qc_rows(
                 "identity",
                 "FLAG",
                 "NOT_CHECKED",
-                reason="ai_chat_log_unavailable",
-                expected_for_planning_mode=ai_condition,
+                reason="required_ai_chat_log_unavailable",
             )
     else:
+        add(
+            "AI_CHAT_JSON_VALID",
+            "ai_chat",
+            "ERROR",
+            "PASS",
+            filename=chat_info.filename if chat_info is not None else None,
+        )
         scalar_match(
             "AI_CHAT_SUBJECT_CODE_MATCH",
             "ai_chat",
@@ -2109,6 +2549,7 @@ def process_zip(path: Path) -> ParsedPackage:
                 archive,
                 members,
                 metadata_info,
+                content_applicable=planning_mode == "a",
             )
             ai_chat_present = chat_info is not None
 
@@ -2367,7 +2808,7 @@ def process_batch(
     report_rows: list[dict[str, Any]] = []
     timeseries_rows: list[dict[str, Any]] = []
     qc_rows: list[dict[str, Any]] = []
-    seen: dict[tuple[str, int, str], ParsedPackage] = {}
+    seen: dict[tuple[str, int], ParsedPackage] = {}
 
     processed = 0
     duplicates = 0
@@ -2380,12 +2821,19 @@ def process_batch(
             identity = (
                 str(row["participant"]),
                 int(row["task"]),
-                str(row["condition"]),
             )
             previous = seen.get(identity)
 
             if previous is not None:
-                if previous.research_sha256 == package.research_sha256:
+                previous_condition = str(
+                    previous.manifest_row["condition"]
+                )
+                current_condition = str(row["condition"])
+                same_condition = previous_condition == current_condition
+                if (
+                    same_condition
+                    and previous.research_sha256 == package.research_sha256
+                ):
                     duplicates += 1
                     qc_rows.append(
                         make_qc_row(
@@ -2419,23 +2867,36 @@ def process_batch(
                     continue
 
                 failed += 1
-                conflict_message = (
-                    "Conflicting packages share participant-task-condition "
-                    "but have different research contents: "
-                    f"{previous.source_zip.name} and {zip_path.name}"
-                )
+                if same_condition:
+                    conflict_rule = "DUPLICATE_PACKAGE_CONFLICT"
+                    conflict_message = (
+                        "Conflicting packages share participant-task-condition "
+                        "but have different research contents: "
+                        f"{previous.source_zip.name} and {zip_path.name}"
+                    )
+                else:
+                    conflict_rule = "PARTICIPANT_TASK_CONDITION_CONFLICT"
+                    conflict_message = (
+                        "A participant-task pair appears under more than one "
+                        "condition: "
+                        f"{previous.source_zip.name} ({previous_condition}) "
+                        f"and {zip_path.name} ({current_condition})"
+                    )
                 qc_rows.append(
                     make_qc_row(
                         zip_path.name,
                         row["participant"],
                         row["task"],
                         row["condition"],
-                        "DUPLICATE_PACKAGE_CONFLICT",
+                        conflict_rule,
                         "batch",
                         "ERROR",
                         "FAIL",
                         original_source_zip=previous.source_zip.name,
                         conflicting_source_zip=zip_path.name,
+                        original_condition=previous_condition,
+                        conflicting_condition=current_condition,
+                        uniqueness_key=[row["participant"], row["task"]],
                     )
                 )
                 report_rows.append(
