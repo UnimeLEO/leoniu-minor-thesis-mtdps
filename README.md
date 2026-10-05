@@ -10,6 +10,8 @@ Extract writing time series.
 ## 0.2.1 - Oct 4, 2026
 Completed task-level and raw-text extraction, and established a closed-loop word-count process series spanning from minute-by-minute snapshots to the actual point of writing completion.
 
+---
+
 ## 0.3 - Quality Control Version Series
 ### 0.3.0 - Oct 4, 2026
 - Added `output/qc_report.csv`;
@@ -57,3 +59,22 @@ Added QC checks for anomalous editing:
 Duplicate detection logic updated to first ensure uniqueness of the `(participant, task)` pair; encountering different conditions for the same task triggers `PARTICIPANT_TASK_CONDITION_CONFLICT` / `ERROR`.
 `LAST_SNAPSHOT_MATCHES_FINAL_ESSAY` reclassified as `INFO` (excluded from the legacy warnings summary); other technical anomalies regarding snapshots or time-series data remain classified as `WARNING`.
 Maintained compatibility with version 0.3.0 time-series and raw essay output formats.
+
+---
+
+## 0.4 - Writing Trajectory Visualiser (WTV)
+Modules: matplotlib, pandas
+**Copy following codes to the Terminal before you run the code.**
+```
+python -m pip install matplotlib pandas
+```
+
+### 0.4.0 - Oct 5, 2026
+- Generate a 2×3 panel layout based on `AH | IH | NH / AL | IL | NL`.
+- Plot each participant-task combination as a separate line, adding only the derived (0,0) point in memory.
+- Use `elapsed_time_seconds` / 60; retain the rise, fall, and negative delta at the endpoint.
+- Define the `writing_end` strictly as the trajectory endpoint; issue an explicit warning if data is missing or duplicated.
+- Output as 300 dpi PNG and vector PDF.
+
+### 0.4.0b - Oct 5, 2026
+
