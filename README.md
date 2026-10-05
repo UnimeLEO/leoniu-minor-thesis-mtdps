@@ -42,4 +42,18 @@ Checks now covered:
 - Detection of events occurring after the writing-end timestamp;
 - Verification of the writing-end timestamp against metadata.
 
-### 0.3.1 - Oct 4, 2026
+### 0.3.1 - Oct 5, 2026
+Time consistency tolerance updated: ≤10 ms = PASS, >10 ms = WARNING; evidence records the actual difference and the tolerance value.
+Added `NOT_APPLICABLE` status; used for AI chat content and identity checks in non-AI conditions.
+Replay the full `beforeinput`/`input` editing chain starting from empty text and compare the result precisely against `final_text.txt`.
+Browser cursor positions interpreted via UTF-16 offsets to ensure compatibility with non-BMP characters.
+Added QC checks for anomalous editing:
+- Large insertions: default ≥50 characters
+- Batch replacements: default removal of ≥20 characters in a single operation
+- `input` events lacking a matching `beforeinput`
+- `paste`, `drop`, or `yank` events
+- Pasted content already present in the essay: `possibly_internal_copy`
+- Otherwise: `source_unknown_or_external` (avoids assuming the source is definitely external)
+Duplicate detection logic updated to first ensure uniqueness of the `(participant, task)` pair; encountering different conditions for the same task triggers `PARTICIPANT_TASK_CONDITION_CONFLICT` / `ERROR`.
+`LAST_SNAPSHOT_MATCHES_FINAL_ESSAY` reclassified as `INFO` (excluded from the legacy warnings summary); other technical anomalies regarding snapshots or time-series data remain classified as `WARNING`.
+Maintained compatibility with version 0.3.0 time-series and raw essay output formats.
